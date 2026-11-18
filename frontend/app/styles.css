@@ -351,16 +351,6 @@ footer { display: flex; justify-content: space-between; flex-wrap: wrap; gap: 8p
 @keyframes cpfc-fade { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: none; } }
 @keyframes cpfc-pulse { 50% { opacity: .5; } }
 @keyframes cpfc-route { to { stroke-dashoffset: -120; } }
-/* Ziggy follows the arc path M10 72 Q160 -35 310 72 in a 320×90 viewBox stretched to the box:
-   x is linear in t, y is a parabola peaking at 18.5, so left/top percentages trace it at any width. */
-@keyframes ziggy-x { from { left: 3.125%; } to { left: 96.875%; } }
-@keyframes ziggy-y {
-  0% { top: 80%; animation-timing-function: cubic-bezier(.33, .67, .67, 1); }
-  50% { top: 20.56%; animation-timing-function: cubic-bezier(.33, 0, .67, .33); }
-  100% { top: 80%; }
-}
-@keyframes ziggy-fade { 0%, 100% { opacity: 0; } 8%, 92% { opacity: 1; } }
-@keyframes ziggy-bob { 50% { transform: translate(-50%, -88%) rotate(6deg); } }
 @keyframes spin { to { rotate: 360deg; } }
 .plan-progress { padding: var(--panel-padding); animation: cpfc-fade .3s ease; }
 .ticker { min-height: 1.2em; margin: 0; color: var(--muted); font-size: 14px; }
@@ -376,21 +366,10 @@ footer { display: flex; justify-content: space-between; flex-wrap: wrap; gap: 8p
 .journey-city strong { overflow-wrap: anywhere; font-size: clamp(20px, 2.8vw, 26px); line-height: 1.15; letter-spacing: -.02em; }
 .journey-city:first-child strong { color: var(--red); }
 .journey-city.destination strong { color: var(--blue); }
-.journey-arc { position: relative; align-self: center; height: 80px; min-width: 0; }
+.journey-arc { position: relative; align-self: center; height: 48px; min-width: 0; }
 .journey-arc svg { display: block; width: 100%; height: 100%; overflow: visible; }
 .journey-arc path { fill: none; stroke: var(--blue); stroke-opacity: .45; stroke-width: 2; stroke-dasharray: 5 7; animation: cpfc-route 12s linear infinite; }
-.ziggy-x, .ziggy-y { position: absolute; display: block; width: 0; height: 0; }
-.ziggy-x { left: 50%; top: 0; height: 100%; }
-.ziggy-y { top: 20.56%; }
-.ziggy { display: block; width: auto; height: 52px; max-width: none; }
-.journey-arc .ziggy { position: absolute; transform: translate(-50%, -85%) rotate(-4deg); filter: drop-shadow(0 3px 3px #0002); }
-.plan-progress:is(.preferences, .searching) .ziggy-x { animation: ziggy-x 3.4s linear infinite, ziggy-fade 3.4s linear infinite; }
-.plan-progress:is(.preferences, .searching) .ziggy-y { animation: ziggy-y 3.4s infinite; }
-.plan-progress:is(.preferences, .searching) .journey-arc .ziggy { animation: ziggy-bob .42s ease-in-out infinite; }
-.plan-progress.done .ziggy-x { left: 96.875%; }
-.plan-progress.done .ziggy-y { top: 80%; }
-.ziggy-solo { display: none; margin: 14px auto -6px; }
-.plan-progress .journey-route { padding-top: 26px; }
+.goalie-game { display: block; width: 100%; height: 230px; margin-top: 16px; border-radius: 14px; touch-action: none; cursor: crosshair; user-select: none; -webkit-user-select: none; -webkit-tap-highlight-color: transparent; }
 .stages { display: flex; justify-content: center; gap: 8px; margin: 0; padding: 0; list-style: none; }
 .stages li { display: inline-flex; align-items: center; gap: 6px; padding: 6px 12px; border-radius: 999px; background: var(--fill); color: var(--muted); font-size: 13px; font-weight: 700; }
 .stages li.active { background: var(--soft-blue); color: var(--blue); }
@@ -437,9 +416,8 @@ footer { display: flex; justify-content: space-between; flex-wrap: wrap; gap: 8p
   .price-foot { width: 100%; justify-content: flex-start; }
   .before-book { padding: 12px 14px; }
   .journey-route { grid-template-columns: minmax(70px, auto) minmax(40px, 1fr) minmax(70px, auto); gap: 6px; }
-  .journey-arc { height: 64px; }
-  .journey-arc .ziggy { height: 40px; }
-  .plan-progress .journey-route { padding-top: 22px; }
+  .journey-arc { height: 40px; }
+  .goalie-game { height: 210px; margin-top: 12px; }
   .stages li { padding: 5px 10px; font-size: 12px; }
   footer { flex-direction: column; gap: 6px; padding: 22px 16px; }
 }
@@ -448,7 +426,6 @@ footer { display: flex; justify-content: space-between; flex-wrap: wrap; gap: 8p
   .sponsor { display: none; }
   .journey-arc { display: none; }
   .journey-route { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-  .ziggy-solo { display: block; }
 }
 
 @media (prefers-reduced-motion: reduce) {
