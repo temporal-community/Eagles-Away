@@ -10,6 +10,7 @@ from cpfc_trip.api import create_app
 from cpfc_trip.catalog import load_catalog
 from cpfc_trip.config import Settings
 from cpfc_trip.domain import Brief, CreateSession, SessionInput
+from cpfc_trip.persistence.rate_limit import Hit
 from cpfc_trip.persistence.repository import Repository
 
 
@@ -38,6 +39,85 @@ async def test_session_uses_selected_departure_airports(repository, session_inpu
     )
     assert data.brief.origin_city == "Manchester"
     assert {route.origin for route in data.routes} == {"MAN", "Manchester"}
+
+
+async def test_api_nearby_departure_preserves_brief_and_uses_only_alternate_flights(
+    settings: Settings, repository: Repository, session_input: SessionInput
+) -> None:
+    live = settings.model_copy(update={"planner_mode": "live"})
+    repository.settings = live
+    temporal = AsyncMock()
+    app = create_app(live, repository, temporal)
+    brief = session_input.brief.model_copy(
+        update={
+            "origin_city": " liverpool ",
+            "departure_city": " mANCHESTER ",
+            "budget_tier": "comfort",
+            "private_room": True,
+            "private_bathroom": True,
+        }
+    )
+    async with (
+        app.router.lifespan_context(app),
+        AsyncClient(transport=ASGITransport(app=app), base_url="http://testserver") as client,
+    ):
+        response = await client.post(
+            "/api/sessions",
+            json={"submission_id": str(uuid4()), "brief": brief.model_dump(mode="json")},
+            headers={"Origin": live.frontend_origin, "X-Submission-Token": "x" * 64},
+        )
+    assert response.status_code == 202
+    temporal.start_workflow.assert_awaited_once()
+    frozen = temporal.start_workflow.await_args.args[1]
+    assert frozen.brief == brief.model_copy(
+        update={"origin_city": "Liverpool", "departure_city": "Manchester"}
+    )
+    assert frozen.fixtures == session_input.fixtures
+    assert [(route.mode, route.origin, route.destination) for route in frozen.routes] == [
+        ("flight", "MAN", "LYS")
+    ]
+    (route,) = frozen.routes
+    original = next(route for route in session_input.routes if route.mode == "flight")
+    assert route.enabled == original.enabled
+    assert route.gateway_arrival_hours == original.gateway_arrival_hours
+    assert route.gateway_departure_hours == original.gateway_departure_hours
+    assert route.minimum_transfer_minutes == original.minimum_transfer_minutes
+    assert "Liverpool and Manchester Airport" in route.transfer_note
+
+
+@pytest.mark.parametrize(
+    ("origin", "departure", "mode", "detail"),
+    [
+        ("Liverpool", "Birmingham", "flight", "supported nearby departure city"),
+        ("Belfast", "Manchester", "flight", "supported nearby departure city"),
+        ("Liverpool", "Manchester", "rail", "only available for flights"),
+    ],
+)
+async def test_api_rejects_unavailable_nearby_departure(
+    settings, repository, session_input, origin, departure, mode, detail
+) -> None:
+    temporal = AsyncMock()
+    app = create_app(settings, repository, temporal)
+    async with (
+        app.router.lifespan_context(app),
+        AsyncClient(transport=ASGITransport(app=app), base_url="http://testserver") as client,
+    ):
+        response = await client.post(
+            "/api/sessions",
+            json={
+                "submission_id": str(uuid4()),
+                "brief": {
+                    "fixture_ids": session_input.brief.fixture_ids,
+                    "origin_city": origin,
+                    "departure_city": departure,
+                    "transport_mode": mode,
+                },
+            },
+            headers={"Origin": settings.frontend_origin, "X-Submission-Token": "x" * 64},
+        )
+    assert response.status_code == 422
+    assert detail in response.json()["detail"]
+    temporal.start_workflow.assert_not_awaited()
 
 
 async def test_live_catalog_only_offers_major_airport_cities(settings, repository) -> None:
@@ -167,8 +247,11 @@ async def test_preview_serves_export_and_uses_secure_session_cookie(
     )
     repository = AsyncMock()
     repository.create.return_value = session_input
+    repository.submitted.return_value = False
+    rate_limiter = AsyncMock()
+    rate_limiter.hit.return_value = Hit(count=1, retry_after=60)
     temporal = AsyncMock()
-    app = create_app(preview, repository, temporal)
+    app = create_app(preview, repository, temporal, rate_limiter)
     async with (
         app.router.lifespan_context(app),
         AsyncClient(transport=ASGITransport(app=app), base_url="https://preview.example") as client,

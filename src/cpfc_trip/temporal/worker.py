@@ -19,7 +19,17 @@ async def run() -> None:
     db = engine(settings)
     try:
         client = await connect(settings)
-        search = SearchActivities(SearchCache(db))
+        cache = (
+            SearchCache(
+                db,
+                timedelta(minutes=settings.search_cache_ttl_minutes),
+                stale_if_error=timedelta(minutes=settings.search_cache_stale_if_error_minutes),
+                early_beta=settings.search_cache_early_beta,
+            )
+            if settings.search_cache_enabled and settings.search_cache_ttl_minutes
+            else None
+        )
+        search = SearchActivities(cache)
         deployment = (
             WorkerDeploymentConfig(
                 version=WorkerDeploymentVersion(
@@ -45,7 +55,7 @@ async def run() -> None:
                 search.search_stays,
             ],
             deployment_config=deployment,
-            max_concurrent_activities=8,
+            max_concurrent_activities=settings.worker_max_activities,
             max_heartbeat_throttle_interval=timedelta(seconds=5),
             graceful_shutdown_timeout=timedelta(seconds=150),
         ):
@@ -56,4 +66,6 @@ async def run() -> None:
 
 def main() -> None:
     logging.basicConfig(level=logging.WARNING)
+    logging.getLogger("cpfc_trip").setLevel(logging.INFO)
+    logging.getLogger("temporalio.workflow").setLevel(logging.INFO)
     asyncio.run(run())

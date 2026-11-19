@@ -40,6 +40,9 @@ class Window(Record):
 class Brief(Record):
     fixture_ids: tuple[str, ...] = Field(min_length=1, max_length=4)
     origin_city: str = Field("London", min_length=2, max_length=50)
+    departure_city: str | None = Field(
+        default=None, min_length=2, max_length=50, exclude_if=lambda city: city is None
+    )
     travellers: Party = Party()
     budget_tier: Literal["budget", "value", "comfort"] = "value"
     flexibility: Literal["tight", "day_either_side", "two_days"] = "day_either_side"
@@ -86,6 +89,8 @@ class Fixture(Record):
 class TransferGuidance(Record):
     title: str
     description: str
+    # A few words for compact link chips; the description stays the full guidance.
+    summary: str = ""
     source_url: str
     reviewed_at: AwareDatetime
 
@@ -93,6 +98,7 @@ class TransferGuidance(Record):
 class MapsTransfer(Record):
     title: str
     description: str
+    summary: str = ""
     url: str
 
 
@@ -107,6 +113,8 @@ class Route(Record):
     onward_stations: tuple[str, ...] = ()
     minimum_transfer_minutes: int = Field(180, ge=0)
     transfer_note: str
+    # One-line version of transfer_note for the "Before you book" checklist.
+    transfer_headline: str = ""
     source_urls: tuple[str, ...] = ()
     reviewed_at: AwareDatetime | None = None
     guidance: tuple[TransferGuidance, ...] = Field((), max_length=5)
@@ -222,6 +230,13 @@ class Alternative(Record):
     summary: str
 
 
+class Check(Record):
+    """Something the traveller must confirm before booking: a short headline plus full detail."""
+
+    headline: str
+    detail: str = ""
+
+
 class Trip(Record):
     fixture: Fixture
     journey: Journey | None = None
@@ -230,6 +245,8 @@ class Trip(Record):
     price_coverage: float = Field(0, ge=0, le=1)
     feasibility: Literal["verified", "needs_checks"] = "needs_checks"
     gaps: tuple[str, ...] = ()
+    # Headline form of gaps; empty on trips stored before checks existed.
+    checks: tuple[Check, ...] = ()
     summary: str
     transfers: tuple[TransferGuidance, ...] = Field((), max_length=5)
     maps_transfers: tuple[MapsTransfer, ...] = Field((), max_length=3)
@@ -249,16 +266,57 @@ class Itinerary(Record):
 Phase = Literal["created", "researching", "closed", "failed"]
 
 
+class RecoveryLink(Record):
+    label: str
+    url: str
+
+
+FailureReason = Literal[
+    "no_flights",
+    "flight_timing",
+    "flights_unverified",
+    "connections",
+    "onward_rail",
+    "stay",
+    "private_bathroom",
+    "dates",
+    "no_route",
+    "search_limits",
+    "unavailable",
+]
+
+
+class DatePair(Record):
+    outbound_date: date
+    return_date: date
+
+
+class RecoveryAction(Record):
+    """A next step the run already verified with a successful search."""
+
+    kind: Literal["depart_from", "wider_dates", "without_private_bathroom"]
+    label: str
+    detail: str
+    departure_city: str | None = None
+
+
 class Snapshot(Record):
     development_mode: bool = False
     public_session_id: UUID
     origin_city: str = "London"
+    departure_city: str | None = None
     state_revision: int = 0
     phase: Phase = "created"
     progress_message: str = "Checking routes from London…"
     itinerary: Itinerary | None = None
     # A checked journey or stay can be shown before a complete trip is verified.
     preview_trip: Trip | None = None
+    preview_options: tuple[Trip, ...] = Field((), max_length=2)
+    alternate_origin_city: str | None = None
+    failure_reason: FailureReason | None = None
+    searched_dates: tuple[DatePair, ...] = Field((), max_length=6)
+    recovery_actions: tuple[RecoveryAction, ...] = Field((), max_length=3)
+    recovery_links: tuple[RecoveryLink, ...] = Field((), max_length=4)
 
 
 class SearchSpec(Record):
@@ -270,6 +328,18 @@ class SearchSpec(Record):
     budget_tier: Literal["budget", "value", "comfort"] = "value"
     private_room: bool = False
     private_bathroom: bool = False
+    latest_return: AwareDatetime | None = None
+
+
+FlightFailure = Literal[
+    "provider_empty",
+    "no_timely_flight",
+    "unverified",
+    "unsupported_connection",
+    "onward_rail",
+    "search_limits",
+    "provider_error",
+]
 
 
 class SearchBatch(Record):
@@ -277,3 +347,8 @@ class SearchBatch(Record):
     stays: tuple[Stay, ...] = ()
     gaps: tuple[str, ...] = ()
     calls: int = 0
+    failure: FlightFailure | None = None
+    stale: bool = False
+    listed: int = 0
+    screened: int = 0
+    followed: int = 0

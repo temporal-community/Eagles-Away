@@ -2,6 +2,7 @@
 import { useEffect, useState } from "react";
 import type { Snapshot } from "../lib/api";
 import { type Stage, stageFor, tickerLines } from "../lib/planning";
+import { GoalieGame } from "./goalie-game";
 import { Icon } from "./icons";
 
 function useReducedMotion(): boolean {
@@ -29,15 +30,14 @@ function useTicker(active: boolean, count: number): number {
 
 // Decorative, phase-anchored progress. The .status live region in PlanExperience
 // announces actual phase changes without repeating the rotating copy visually.
-export function PlanningProgress({ snapshot, city, origin = "London", variant = "hero", forceDone = false }: {
+export function PlanningProgress({ snapshot, city, origin = "London", variant = "hero" }: {
   snapshot: Snapshot | null;
   city?: string;
   origin?: string;
   variant?: "hero" | "preview";
-  forceDone?: boolean;
 }) {
   const reduced = useReducedMotion();
-  const stage: Stage = forceDone ? "done" : stageFor(snapshot);
+  const stage: Stage = stageFor(snapshot);
   const preview = snapshot?.preview_trip;
   const lines = variant === "hero" ? tickerLines(stage, city, origin)
     : !preview?.stay ? [city ? `Checking places to stay in ${city}…` : "Checking places to stay…", "Comparing rooms and prices…"]
@@ -54,13 +54,14 @@ export function PlanningProgress({ snapshot, city, origin = "London", variant = 
   const stages = ["Brief", "Search", "Ready"] as const;
   const reached = stage === "done" ? 2 : stage === "searching" ? 1 : 0;
 
-  return <div className={`plan-progress card ${stage}`} aria-hidden="true">
-    <div className="journey-route">
+  return <div className={`plan-progress card ${stage}`}>
+    <div className="journey-route" aria-hidden="true">
       <div className="journey-city"><small>From</small><strong>{origin}</strong></div>
-      <div className="journey-arc"><svg viewBox="0 0 320 90" preserveAspectRatio="none" focusable="false"><path d="M 10 72 Q 160 -35 310 72" /></svg><span className="journey-plane"><Icon name="plane" size={22} /></span></div>
+      <div className="journey-arc"><svg viewBox="0 0 320 90" preserveAspectRatio="none" focusable="false"><path d="M 10 72 Q 160 -35 310 72" /></svg></div>
       <div className="journey-city destination"><small>To</small><strong>{destination}</strong></div>
     </div>
-    <p className="ticker hero"><span key={reduced ? "static" : `${stage}-${index}`} className={reduced ? undefined : "tfade"}>{rotatingText}</span></p>
-    <ol className="stages">{stages.map((name, i) => <li key={name} className={i < reached || stage === "done" ? "done" : i === reached ? "active" : ""}>{i < reached || stage === "done" ? <Icon name="check" size={12} /> : <span className="dot" />}{name}</li>)}</ol>
+    <GoalieGame />
+    <p className="ticker hero" aria-hidden="true"><span key={reduced ? "static" : `${stage}-${index}`} className={reduced ? undefined : "tfade"}>{rotatingText}</span></p>
+    <ol className="stages" aria-hidden="true">{stages.map((name, i) => <li key={name} className={i < reached || stage === "done" ? "done" : i === reached ? "active" : ""}>{i < reached || stage === "done" ? <Icon name="check" size={12} /> : <span className="dot" />}{name}</li>)}</ol>
   </div>;
 }

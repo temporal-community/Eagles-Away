@@ -115,6 +115,8 @@ export interface components {
              * @default London
              */
             origin_city: string;
+            /** Departure City */
+            departure_city?: string | null;
             /**
              * @default {
              *       "adults": 1,
@@ -153,6 +155,19 @@ export interface components {
             /** Transport Mode */
             transport_mode?: ("flight" | "rail") | null;
         };
+        /**
+         * Check
+         * @description Something the traveller must confirm before booking: a short headline plus full detail.
+         */
+        Check: {
+            /** Headline */
+            headline: string;
+            /**
+             * Detail
+             * @default
+             */
+            detail: string;
+        };
         /** Coordinates */
         Coordinates: {
             /** Latitude */
@@ -168,6 +183,19 @@ export interface components {
              */
             submission_id: string;
             brief: components["schemas"]["Brief"];
+        };
+        /** DatePair */
+        DatePair: {
+            /**
+             * Outbound Date
+             * Format: date
+             */
+            outbound_date: string;
+            /**
+             * Return Date
+             * Format: date
+             */
+            return_date: string;
         };
         /** Evidence */
         Evidence: {
@@ -314,6 +342,11 @@ export interface components {
             title: string;
             /** Description */
             description: string;
+            /**
+             * Summary
+             * @default
+             */
+            summary: string;
             /** Url */
             url: string;
         };
@@ -396,6 +429,30 @@ export interface components {
              */
             caveats: string[];
         };
+        /**
+         * RecoveryAction
+         * @description A next step the run already verified with a successful search.
+         */
+        RecoveryAction: {
+            /**
+             * Kind
+             * @enum {string}
+             */
+            kind: "depart_from" | "wider_dates" | "without_private_bathroom";
+            /** Label */
+            label: string;
+            /** Detail */
+            detail: string;
+            /** Departure City */
+            departure_city?: string | null;
+        };
+        /** RecoveryLink */
+        RecoveryLink: {
+            /** Label */
+            label: string;
+            /** Url */
+            url: string;
+        };
         /** Snapshot */
         Snapshot: {
             /**
@@ -413,6 +470,8 @@ export interface components {
              * @default London
              */
             origin_city: string;
+            /** Departure City */
+            departure_city?: string | null;
             /**
              * State Revision
              * @default 0
@@ -431,6 +490,30 @@ export interface components {
             progress_message: string;
             itinerary?: components["schemas"]["Itinerary"] | null;
             preview_trip?: components["schemas"]["Trip"] | null;
+            /**
+             * Preview Options
+             * @default []
+             */
+            preview_options: components["schemas"]["Trip"][];
+            /** Alternate Origin City */
+            alternate_origin_city?: string | null;
+            /** Failure Reason */
+            failure_reason?: ("no_flights" | "flight_timing" | "flights_unverified" | "connections" | "onward_rail" | "stay" | "private_bathroom" | "dates" | "no_route" | "search_limits" | "unavailable") | null;
+            /**
+             * Searched Dates
+             * @default []
+             */
+            searched_dates: components["schemas"]["DatePair"][];
+            /**
+             * Recovery Actions
+             * @default []
+             */
+            recovery_actions: components["schemas"]["RecoveryAction"][];
+            /**
+             * Recovery Links
+             * @default []
+             */
+            recovery_links: components["schemas"]["RecoveryLink"][];
         };
         /** Stay */
         Stay: {
@@ -486,6 +569,11 @@ export interface components {
             title: string;
             /** Description */
             description: string;
+            /**
+             * Summary
+             * @default
+             */
+            summary: string;
             /** Source Url */
             source_url: string;
             /**
@@ -516,6 +604,11 @@ export interface components {
              * @default []
              */
             gaps: string[];
+            /**
+             * Checks
+             * @default []
+             */
+            checks: components["schemas"]["Check"][];
             /** Summary */
             summary: string;
             /**

@@ -6,7 +6,7 @@ from importlib.resources import files
 from zoneinfo import ZoneInfo
 
 from cpfc_trip.domain import Brief, Fixture, Route, Window
-from cpfc_trip.origins import canonical_origin
+from cpfc_trip.origins import alternate_departure_cities, canonical_origin
 
 
 def load_catalog() -> tuple[tuple[Fixture, ...], tuple[Route, ...]]:
@@ -18,6 +18,20 @@ def load_catalog() -> tuple[tuple[Fixture, ...], tuple[Route, ...]]:
 
 def validate_brief(brief: Brief, fixtures: tuple[Fixture, ...], now: datetime) -> Brief:
     origin_city = canonical_origin(brief.origin_city)
+    departure_city = brief.departure_city
+    if departure_city is not None:
+        if brief.transport_mode == "rail":
+            raise ValueError("A nearby departure city is only available for flights")
+        departure_city = next(
+            (
+                city
+                for city in alternate_departure_cities(origin_city)
+                if city.casefold() == departure_city.strip().casefold()
+            ),
+            None,
+        )
+        if departure_city is None:
+            raise ValueError("Choose a supported nearby departure city for your starting city")
     selected = {x.id: x for x in fixtures}
     if not set(brief.fixture_ids) <= selected.keys():
         raise ValueError("Choose fixtures from the Palace catalog")
@@ -39,4 +53,10 @@ def validate_brief(brief: Brief, fixtures: tuple[Fixture, ...], now: datetime) -
         if w.latest_return <= now:
             raise ValueError("Travel window is in the past")
         windows[fixture_id] = w
-    return brief.model_copy(update={"origin_city": origin_city, "windows": tuple(windows.values())})
+    return brief.model_copy(
+        update={
+            "origin_city": origin_city,
+            "departure_city": departure_city,
+            "windows": tuple(windows.values()),
+        }
+    )

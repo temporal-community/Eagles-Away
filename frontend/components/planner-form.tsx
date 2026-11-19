@@ -14,6 +14,8 @@ import { Switch, SwitchThumb } from "@ui-sdk/react/switch";
 import { Brief, Fixture, londonDayBoundary, request } from "../lib/api";
 import formCatalog from "../lib/form-catalog.json";
 import { trackAnalytics } from "../lib/analytics";
+import { readBrowserBrief } from "../lib/browser-brief";
+import { usePlanSubmission } from "../lib/use-plan-submission";
 import { CPFC_TICKET_URL } from "../lib/tickets";
 import { addDays, country, dateParts, day, dayRange, daysUntil, flag, kickoff, londonDate } from "../lib/trip-format";
 import { Icon } from "./icons";
@@ -59,11 +61,11 @@ export function PlannerForm() {
   const router = useRouter();
   const formRef = useRef<HTMLFormElement>(null);
   const headingRef = useRef<HTMLHeadingElement>(null);
-  const attempt = useRef<{ id: string; token: string; body: string } | null>(null);
   const [fixtures, setFixtures] = useState<Fixture[]>(bundledFixtures);
   const [originCities, setOriginCities] = useState<string[]>(formCatalog.origin_cities);
   const [railCities, setRailCities] = useState<string[]>(formCatalog.rail_cities);
   const [origin, setOrigin] = useState("London");
+  const [departureCity, setDepartureCity] = useState<string | null>(null);
   const [transport, setTransport] = useState<Brief["transport_mode"]>(null);
   const [selected, setSelected] = useState(bundledFixtures[0]?.id ?? "");
   const [step, setStep] = useState(0);
@@ -78,12 +80,16 @@ export function PlannerForm() {
   const [privateRoom, setPrivateRoom] = useState(false);
   const [privateBathroom, setPrivateBathroom] = useState(false);
   const [error, setError] = useState("");
-  const [busy, setBusy] = useState(false);
+  const { startPlan, starting, opening, busy } = usePlanSubmission(router.push, setError);
   const [sample, setSample] = useState(false);
   const [now, setNow] = useState<Date | null>(null);
 
   useEffect(() => {
     let cancelled = false;
+    const params = new URLSearchParams(window.location.search);
+    const editSession = params.get("edit");
+    const saved = editSession ? readBrowserBrief(editSession)?.brief : undefined;
+    const savedFixture = saved?.fixture_ids[0];
     // The static HTML and first hydration render share the same catalog; prune past games afterward.
     queueMicrotask(() => {
       if (cancelled) return;
@@ -91,6 +97,20 @@ export function PlannerForm() {
       setNow(new Date());
       setFixtures(upcomingBundled);
       setSelected(current => selectedOrFirst(current, upcomingBundled));
+      if (!saved || !savedFixture) return;
+      const windowForFixture = saved.windows?.find(window => window.fixture_id === savedFixture);
+      setSelected(savedFixture);
+      setOrigin(saved.origin_city);
+      setDepartureCity(saved.departure_city ?? null);
+      setTransport(saved.departure_city ? "flight" : saved.transport_mode ?? null);
+      setLength(windowForFixture ? "custom" : saved.flexibility);
+      setRange(windowForFixture ? [windowForFixture.earliest_departure.slice(0, 10), windowForFixture.latest_return.slice(0, 10)] : null);
+      setAdults(saved.travellers.adults);
+      setChildren(saved.travellers.child_ages);
+      setRooms(saved.travellers.rooms);
+      setBudget(saved.budget_tier);
+      setPrivateRoom(saved.private_room ?? false);
+      setPrivateBathroom(saved.private_bathroom ?? false);
     });
     request<{ fixtures: Fixture[]; origin_cities: string[]; rail_cities: string[]; development_mode: boolean }>("/api/catalog")
       .then(data => {
@@ -99,7 +119,7 @@ export function PlannerForm() {
         setFixtures(upcoming);
         setOriginCities(data.origin_cities ?? ["London"]);
         setRailCities(data.rail_cities ?? ["London"]);
-        setSelected(current => selectedOrFirst(current, upcoming));
+        setSelected(current => current === savedFixture && !upcoming.some(f => f.id === current) ? "" : selectedOrFirst(current, upcoming));
         setSample(data.development_mode);
       })
       .catch(() => { if (!cancelled) setError("The planner is unavailable. Please reload to try again."); });
@@ -109,6 +129,10 @@ export function PlannerForm() {
   useEffect(() => {
     if (hasNavigated) headingRef.current?.focus();
   }, [step, hasNavigated]);
+
+  useEffect(() => {
+    if (step === 1) router.prefetch("/plan/");
+  }, [router, step]);
 
   function moveTo(next: number) {
     if (step === 0 && next === 1) trackAnalytics("form_match_complete");
@@ -122,7 +146,7 @@ export function PlannerForm() {
       setError("Choose a UK departure city.");
       return;
     }
-    if (step === 0 && !selected) {
+    if (step === 0 && !selectedFixture) {
       setError("Choose an away match to continue.");
       return;
     }
@@ -148,13 +172,12 @@ export function PlannerForm() {
 
   async function submit(event: React.FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    if (step !== 1 || !selected) return;
-    setBusy(true);
-    setError("");
+    if (step !== 1 || !selectedFixture || busy) return;
     const customDates = length === "custom" ? range : null;
     const brief: Brief = {
       fixture_ids: [selected],
       origin_city: origin,
+      ...(departureCity ? { departure_city: departureCity } : {}),
       travellers: { adults, child_ages: children, rooms },
       budget_tier: budget,
       flexibility: length === "custom" ? "day_either_side" : length,
@@ -163,28 +186,14 @@ export function PlannerForm() {
       private_bathroom: privateBathroom,
       transport_mode: mode,
     };
-    const content = JSON.stringify({ brief });
-    if (!attempt.current || attempt.current.body !== content) {
-      attempt.current = { id: crypto.randomUUID(), token: [...crypto.getRandomValues(new Uint8Array(32))].map(x => x.toString(16).padStart(2, "0")).join(""), body: content };
-    }
-    try {
-      const result = await request<{ public_session_id: string }>("/api/sessions", {
-        method: "POST", headers: { "X-Submission-Token": attempt.current.token },
-        body: JSON.stringify({ submission_id: attempt.current.id, ...JSON.parse(content) }),
-      });
-      if (result) {
-        trackAnalytics("trip_started");
-        try { if (selectedFixture) sessionStorage.setItem(`cpfc-city-${result.public_session_id}`, selectedFixture.city); } catch { /* ignore */ }
-        router.push(`/plan/?session=${result.public_session_id}`);
-      }
-    } catch (e) { setError(e instanceof Error ? e.message : "Please retry."); }
-    finally { setBusy(false); }
+    await startPlan(brief, selectedFixture.city);
   }
 
   const heading = (index: number, text: string) => <h2 id={step === index ? "form-step-heading" : undefined} ref={step === index ? headingRef : undefined} tabIndex={-1}>{text}</h2>;
-  const searchNote = origin === "London"
-    ? `LHR, LGW, STN, LTN${railAvailable ? " + Eurostar" : ""}`
-    : `${origin} airport${railAvailable ? " + trains via London and Paris" : ""}`;
+  const searchCity = departureCity ?? origin;
+  const airports = searchCity === "London" ? "LHR, LGW, STN, LTN" : `${searchCity} airport`;
+  const railNote = origin === "London" ? " + Eurostar" : " + trains via London and Paris";
+  const searchNote = railAvailable && !departureCity ? airports + railNote : airports;
 
   return <form ref={formRef} className="brief card" onSubmit={submit}>
     {sample && <div className="notice">Development preview · Synthetic trips and prices</div>}
@@ -201,7 +210,12 @@ export function PlannerForm() {
         {heading(0, "Pick your match")}
         <Field>
           <FieldLabel>Starting from</FieldLabel>
-          <Select value={origin} onValueChange={value => { if (value) { setOrigin(value); setTransport(null); } }} items={originCities}>
+          <Select value={origin} onValueChange={value => {
+            if (!value || value === origin) return;
+            setOrigin(value);
+            setDepartureCity(null);
+            setTransport(null);
+          }} items={originCities}>
             <SelectTrigger className="select-trigger">
               <Icon name="pin" />
               <SelectValue />
@@ -214,7 +228,12 @@ export function PlannerForm() {
         </Field>
         <Field>
           <FieldLabel>Away match</FieldLabel>
-          <RadioGroup className="fixtures" name="fixture" value={selected} onValueChange={value => { if (value) { setSelected(value); setTransport(null); setRange(null); } }}>
+          <RadioGroup className="fixtures" name="fixture" value={selected} onValueChange={value => {
+            if (!value) return;
+            setSelected(value);
+            if (!departureCity) setTransport(null);
+            setRange(null);
+          }}>
             {fixtures.map(f => {
               const date = dateParts(f);
               const days = now ? daysUntil(f.kickoff_at, now) : null;
@@ -241,7 +260,7 @@ export function PlannerForm() {
           </SegmentedControl>
           {length !== "custom" && <FieldDescription>{lengths.find(t => t.value === length)?.hint}</FieldDescription>}
         </Field>
-        {length === "custom" && <DatePicker className="range-picker" mode="range" locale="en-GB" value={range} onValueChange={value => setRange(Array.isArray(value) ? value as [string, string] : null)} min={now ? londonDate(now.toISOString()) : undefined} minDays={2} defaultMonth={matchDate.slice(0, 7)} weekStartsOn={1} timeZone="Europe/London">
+        {length === "custom" && matchDate && <DatePicker className="range-picker" mode="range" locale="en-GB" value={range} onValueChange={value => setRange(Array.isArray(value) ? value as [string, string] : null)} min={now ? londonDate(now.toISOString()) : undefined} minDays={2} defaultMonth={matchDate.slice(0, 7)} weekStartsOn={1} timeZone="Europe/London">
           <div className="range-fields" ref={setCalendarAnchor}>
             <label className="range-end"><small>Leave</small><DatePickerInput aria-label="Leave" /></label>
             <Icon name="arrowRight" size={16} className="icon range-arrow" />
@@ -278,7 +297,10 @@ export function PlannerForm() {
         {!sample && <p className="hint"><Icon name="users" size={14} />One shared room for your group.</p>}
         <Field>
           <FieldLabel>Travel by</FieldLabel>
-          <SegmentedControl className="segmented" value={mode ?? "any"} onValueChange={value => setTransport(value === "any" ? null : value as Brief["transport_mode"])}>
+          <SegmentedControl className="segmented" value={mode ?? "any"} onValueChange={value => {
+            if (value !== "flight") setDepartureCity(null);
+            setTransport(value === "any" ? null : value as Brief["transport_mode"]);
+          }}>
             <SegmentedControlIndicator />
             <SegmentedControlItem value="any" disabled={!railAvailable}><Icon name="route" />Compare</SegmentedControlItem>
             <SegmentedControlItem value="flight"><Icon name="plane" />Flights</SegmentedControlItem>
@@ -304,7 +326,7 @@ export function PlannerForm() {
         <p className="hint"><Icon name="plane" size={14} />Searching {searchNote}, nonstop first{selectedFixture?.city === "Białystok" ? ", + Warsaw–Białystok train" : ""}.</p>
         <div className="form-actions">
           <Button className="secondary" onClick={() => moveTo(0)}><Icon name="arrowLeft" />Back</Button>
-          <Button type="submit" className="primary" disabled={!selected || busy}>{busy ? "Starting…" : <>Plan my away day<Icon name="arrowRight" /></>}</Button>
+          <Button type="submit" className="primary" disabled={!selectedFixture || busy}>{opening ? "Opening your plan…" : starting ? "Starting…" : <>Plan my away day<Icon name="arrowRight" /></>}</Button>
         </div>
         <p className="hint center">No account needed · <Link href="/privacy/">How we use your data</Link></p>
       </section>

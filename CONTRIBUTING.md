@@ -50,6 +50,10 @@ Use `recorded` for UI work. Before switching to `live`, check your mode and rema
 uv run --locked python scripts/check-credentials.py --check-live
 ```
 
+Positive results are fresh for 24 hours by default. The worker can refresh them early and fall back to a clearly marked older positive result on a provider error. Set `SEARCH_CACHE_TTL_MINUTES`, `SEARCH_CACHE_EARLY_BETA` and `SEARCH_CACHE_STALE_IF_ERROR_MINUTES` to tune that policy. Completed flight dead ends are cached for at most one hour. They are never served as stale fallback, and provider errors and truncated searches do not enter the negative cache. To bypass the persistent cache for local timing, start the worker with `SEARCH_CACHE_ENABLED=false scripts/dev/worker.sh`.
+
+To compare search changes without paid calls, `scripts/benchmark/` replays simulated SearchApi results through the real API, workflow and worker, with the cache shared, cleared per case (`--cold-cache`) or off (`--no-cache`). See its README.
+
 ### Without Docker
 
 `scripts/dev/preview.sh` runs the API and worker against a local SQLite file in recorded mode, overriding `.env`. You still need the Temporal server and the frontend:
@@ -135,7 +139,25 @@ The site runs on DigitalOcean App Platform, app `373808be-b5ec-4d20-b7fc-d8dbe90
 | `web` (static site and API), `migrate` (predeploy) and `retention` jobs | `main` |
 | `planner-main` worker, two replicas | A frozen release branch, `codex/worker-release-<sha>` |
 
-A release builds the worker from its own branch and promotes it in Temporal Cloud (namespace `gcp-shy-projects.a2dd6`, Worker Deployment `cpfc-trip`, build ID = full commit SHA) after its pollers register on the hosted queue `eagles-away-do-preview-v1`. The [deployment record](planning/2026-10-06-deployment-readiness.md) has the full procedure and history.
+A release builds the worker from a frozen branch with its full commit SHA as the build ID. The hosted namespace is `gcp-shy-projects.a2dd6`, the Worker Deployment is `cpfc-trip`, and the queue is `eagles-away-do-preview-v1`. Follow the [V5 cutover procedure](planning/2026-10-06-deployment-readiness.md#v5-cutover-not-yet-deployed) before deploying this workflow rename.
+
+The hosted spec currently uses `APP_ENV=preview` and sets `WORKER_BUILD_ID` on `planner-main` only. Set `APP_ENV=production` and the matching `WORKER_BUILD_ID` on `web` at cutover. Production requires live planning and Temporal TLS. The API pins new sessions to that ID when it is set; do not admit new sessions until its Workflow and Activity pollers are registered.
+
+Capacity settings (environment variables):
+
+| Setting | Default | Meaning |
+| --- | --- | --- |
+| `SESSION_CREATE_PER_MINUTE` | 3 | New sessions per IPv4 address or IPv6 /64 per minute; over it the API returns 429 with `Retry-After` |
+| `SESSION_CREATE_PER_10_MINUTES` | 10 | New sessions across all clients per fixed 10-minute window; over it the API returns 503 with `Retry-After` |
+| `SNAPSHOT_POLLS_PER_MINUTE` | 240 | Snapshot polls per IPv4 address or IPv6 /64 per minute, per API instance |
+| `WORKER_MAX_ACTIVITIES` | 64 | Concurrent activities per worker; each session runs about four searches at once |
+| `DATABASE_POOL_SIZE` / `DATABASE_MAX_OVERFLOW` | 4 / 2 | PostgreSQL connections per process |
+
+All API instances share session quotas through `rate_limit_hits`. Retrying a submission that already created a session is free. On App Platform, the API reads `do-connecting-ip` in preview or production and does not read `X-Forwarded-For`. Run `cpfc-prune` hourly to remove old rate-limit records.
+
+The default cap admits 60 sessions in six 10-minute windows. At about 17 uncached requests per admitted session, that is roughly 1,020 SearchApi requests, below the documented 2,000/hour allowance. This is an admission estimate, not a provider request cap. Check hourly and monthly usage before changing it.
+
+For PostgreSQL, add pool size + overflow for every API process, both generations of workers during overlap, and each concurrent migration or retention job. Reserve headroom for operations below the cluster limit. The [cutover procedure](planning/2026-10-06-deployment-readiness.md#v5-cutover-not-yet-deployed) gives an example.
 
 To monitor:
 

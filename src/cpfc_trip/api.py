@@ -2,11 +2,14 @@
 
 import base64
 import binascii
+import ipaddress
+import math
 import re
 import secrets
 import time
 from collections import defaultdict, deque
-from contextlib import asynccontextmanager
+from collections.abc import Iterator
+from contextlib import asynccontextmanager, contextmanager
 from datetime import timedelta
 from typing import Annotated, Any
 from uuid import UUID
@@ -18,24 +21,37 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy import text
+from sqlalchemy.exc import DBAPIError, InterfaceError, OperationalError
+from sqlalchemy.exc import TimeoutError as PoolTimeoutError
 from temporalio.client import Client, WorkflowExecutionStatus, WorkflowQueryFailedError
-from temporalio.common import WorkflowIDConflictPolicy, WorkflowIDReusePolicy
+from temporalio.common import (
+    PinnedVersioningOverride,
+    WorkerDeploymentVersion,
+    WorkflowIDConflictPolicy,
+    WorkflowIDReusePolicy,
+)
 from temporalio.exceptions import WorkflowAlreadyStartedError
-from temporalio.service import RPCError
+from temporalio.service import RPCError, RPCStatusCode
 
 from cpfc_trip.catalog import load_catalog
 from cpfc_trip.config import Settings
 from cpfc_trip.domain import CreateSession, Snapshot
 from cpfc_trip.origins import LIVE_ORIGINS, UK_RAIL
 from cpfc_trip.persistence.database import engine
+from cpfc_trip.persistence.rate_limit import SharedRateLimiter
 from cpfc_trip.persistence.repository import Repository
 from cpfc_trip.temporal.client import connect
 from cpfc_trip.temporal.workflow import TravelPlanningSessionWorkflow
 
+INTERRUPTED = {
+    WorkflowExecutionStatus.FAILED,
+    WorkflowExecutionStatus.TERMINATED,
+    WorkflowExecutionStatus.TIMED_OUT,
+    WorkflowExecutionStatus.CANCELED,
+}
+
 
 class LocalLimiter:
-    """Local development limiter. The public deployment also requires shared edge quotas."""
-
     def __init__(self) -> None:
         self.hits: dict[str, deque[float]] = defaultdict(deque)
 
@@ -49,16 +65,48 @@ class LocalLimiter:
         while q and q[0] < now - seconds:
             q.popleft()
         if len(q) >= limit:
+            retry_after = max(1, math.ceil(q[0] + seconds - now))
             raise HTTPException(
-                429, "Too many requests; please try again shortly", headers={"Retry-After": "10"}
+                429,
+                "Too many requests; please try again shortly",
+                headers={"Retry-After": str(retry_after)},
             )
         q.append(now)
+
+
+@contextmanager
+def database_available() -> Iterator[None]:
+    try:
+        yield
+    except (DBAPIError, PoolTimeoutError, OSError) as error:
+        if isinstance(error, DBAPIError) and not (
+            error.connection_invalidated or isinstance(error, OperationalError | InterfaceError)
+        ):
+            raise
+        raise HTTPException(
+            503,
+            "Trip planning is temporarily unavailable. Please try again shortly.",
+            headers={"Retry-After": "5"},
+        ) from None
+
+
+def _ip_bucket(value: str) -> str | None:
+    try:
+        address = ipaddress.ip_address(value)
+    except ValueError:
+        return None
+    if isinstance(address, ipaddress.IPv6Address):
+        if address.ipv4_mapped is not None:
+            return str(address.ipv4_mapped)
+        return str(ipaddress.IPv6Network((int(address), 64), strict=False))
+    return str(address)
 
 
 def create_app(
     settings: Settings | None = None,
     repository: Repository | None = None,
     temporal: Client | None = None,
+    rate_limiter: SharedRateLimiter | None = None,
 ) -> FastAPI:
     config = settings or Settings()
     limiter = LocalLimiter()
@@ -67,6 +115,7 @@ def create_app(
     async def lifespan(app: FastAPI):  # type: ignore[no-untyped-def]
         db = engine(config)
         app.state.repository = repository or Repository(db, config)
+        app.state.rate_limiter = rate_limiter or SharedRateLimiter(app.state.repository.sessions)
         app.state.temporal = temporal or await connect(config)
         try:
             yield
@@ -146,12 +195,38 @@ def create_app(
         return request.app.state.temporal  # type: ignore[no-any-return]
 
     def ip(request: Request) -> str:
-        # Do not trust arbitrary forwarded IP headers. The deployment proxy is configured separately.
-        return request.client.host if request.client else "unknown"
+        # App Platform's edge sets do-connecting-ip to the client address; X-Forwarded-For only
+        # holds its ingress there and is client-controlled elsewhere, so it is never read.
+        if config.app_env in {"preview", "production"}:
+            forwarded = _ip_bucket(request.headers.get("do-connecting-ip", ""))
+            if forwarded is not None:
+                return forwarded
+        return (_ip_bucket(request.client.host) if request.client else None) or "unknown"
+
+    async def admit(request: Request) -> None:
+        shared: SharedRateLimiter = request.app.state.rate_limiter
+        client_hit = await shared.hit(f"create:{ip(request)}", 60)
+        if client_hit.count > config.session_create_per_minute:
+            raise HTTPException(
+                429,
+                "Too many requests; please try again shortly",
+                headers={"Retry-After": str(client_hit.retry_after)},
+            )
+        everyone = await shared.hit("create:all", 600)
+        if everyone.count > config.session_create_per_10_minutes:
+            raise HTTPException(
+                503,
+                "Trip planning is busy right now. Please try again in a few minutes.",
+                headers={"Retry-After": str(everyone.retry_after)},
+            )
 
     async def authorize(request: Request, public_id: UUID) -> None:
         token = request.cookies.get(f"cpfc_{public_id}", "")
-        if not token or not await repo(request).authorize(public_id, token):
+        if not token:
+            raise HTTPException(404, "Session not found or access expired")
+        with database_available():
+            allowed = await repo(request).authorize(public_id, token)
+        if not allowed:
             raise HTTPException(404, "Session not found or access expired")
 
     @app.get("/api/catalog")
@@ -177,13 +252,15 @@ def create_app(
     ) -> dict[str, Any]:
         if not re.fullmatch(r"[A-Za-z0-9_-]{43,128}", token):
             raise HTTPException(422, "A strong submission token is required")
-        limiter.check(f"create:{ip(request)}", 5)
-        try:
-            data = await repo(request).create(body, token)
-        except ValueError as error:
-            raise HTTPException(422, str(error)) from None
-        except PermissionError:
-            raise HTTPException(409, "Submission ID is already in use") from None
+        with database_available():
+            if not await repo(request).submitted(body.submission_id, token):
+                await admit(request)
+            try:
+                data = await repo(request).create(body, token)
+            except ValueError as error:
+                raise HTTPException(422, str(error)) from None
+            except PermissionError:
+                raise HTTPException(409, "Submission ID is already in use") from None
         try:
             await client(request).start_workflow(
                 TravelPlanningSessionWorkflow.run,
@@ -192,6 +269,16 @@ def create_app(
                 task_queue=config.temporal_task_queue,
                 id_conflict_policy=WorkflowIDConflictPolicy.USE_EXISTING,
                 id_reuse_policy=WorkflowIDReusePolicy.REJECT_DUPLICATE,
+                execution_timeout=timedelta(seconds=data.limits.planning_seconds + 120),
+                versioning_override=(
+                    PinnedVersioningOverride(
+                        WorkerDeploymentVersion(
+                            deployment_name="cpfc-trip", build_id=config.worker_build_id
+                        )
+                    )
+                    if config.worker_build_id
+                    else None
+                ),
                 rpc_timeout=timedelta(seconds=5),
             )
         except WorkflowAlreadyStartedError:
@@ -214,6 +301,7 @@ def create_app(
     async def snapshot(
         public_id: UUID, request: Request, after_revision: Annotated[int | None, Query(ge=0)] = None
     ) -> Snapshot | Response:
+        limiter.check(f"poll-ip:{ip(request)}", config.snapshot_polls_per_minute)
         await authorize(request, public_id)
         limiter.check(f"poll:{public_id}", 90)
         handle = client(request).get_workflow_handle(f"travel-session/{public_id}")
@@ -227,15 +315,26 @@ def create_app(
             # Completed results stay readable after the worker build that ran them retires.
             try:
                 description = await handle.describe(rpc_timeout=timedelta(seconds=5))
-                if description.status != WorkflowExecutionStatus.COMPLETED:
-                    raise HTTPException(503, "Reconnecting to your saved planning session")
+            except RPCError as error:
+                if error.status == RPCStatusCode.NOT_FOUND:
+                    raise HTTPException(
+                        404, "This search was interrupted. Please start it again."
+                    ) from None
+                raise HTTPException(503, "Reconnecting to your saved planning session") from None
+            if description.status in INTERRUPTED:
+                raise HTTPException(
+                    404, "This search was interrupted. Please start it again."
+                ) from None
+            if description.status != WorkflowExecutionStatus.COMPLETED:
+                raise HTTPException(503, "Reconnecting to your saved planning session") from None
+            try:
                 value = Snapshot.model_validate(
                     await handle.result(rpc_timeout=timedelta(seconds=5))
                 )
-                if value.state_revision == after_revision:
-                    value = None
             except (RPCError, WorkflowQueryFailedError):
                 raise HTTPException(503, "Reconnecting to your saved planning session") from None
+            if value.state_revision == after_revision:
+                value = None
         return value if value else Response(status_code=204)
 
     @app.get("/healthz")

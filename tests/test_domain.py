@@ -45,9 +45,9 @@ def test_preview_only_grows_with_matching_dates(session_input):
     later_stay = stay_first.model_copy(
         update={"stay": stay.model_copy(update={"check_in": stay.check_in + timedelta(days=1)})}
     )
-    kept, journey_found = grow(later_stay, [flights])
+    travel, journey_found = grow(later_stay, [flights])
     assert journey_found
-    assert kept is later_stay
+    assert travel and travel.journey and travel.stay is None
 
     both, _ = grow(stay_first, [stays, flights])
     assert both and both.stay == stay and both.journey == flights.journeys[0]
@@ -105,6 +105,13 @@ def test_all_four_away_matches_have_enabled_live_routes():
         "london-szg",
     }
     assert all(fixture.venue_location for fixture in fixtures)
+
+
+def test_enabled_routes_have_short_headlines_for_the_checklist():
+    _, routes = load_catalog()
+    for route in (r for r in routes if r.enabled):
+        assert 0 < len(route.transfer_headline) <= 60, route.id
+        assert all(0 < len(g.summary) <= 40 for g in route.guidance), route.id
 
 
 def test_uk_departure_city_resolves_without_guessing(session_input):

@@ -34,6 +34,8 @@ scripts/dev/frontend.sh
 
 Open [localhost:3000](http://localhost:3000). A fresh checkout uses recorded sample trips, so you can explore the app without paid travel searches.
 
+For live searches, set `PLANNER_MODE=live` and `SEARCHAPI_API_KEY` in `.env`. Results are reused for `SEARCH_CACHE_TTL_MINUTES` (one day by default, so repeating a search returns in under a second); set it to `0` to make every search call SearchApi. If SearchApi fails, a cached result up to `SEARCH_CACHE_STALE_IF_ERROR_MINUTES` past that is shown instead, marked as from an earlier check. `SEARCH_CACHE_EARLY_BETA` refreshes popular or slow searches shortly before they expire (probabilistic early expiration); `0` turns that off. `uv run python scripts/measure-search-cache.py` times one paid cold search against cached reruns in a throwaway database.
+
 To check a change, stop the frontend development server and run `scripts/check.sh`. For the PostgreSQL checks too, set `TEST_DATABASE_URL=postgresql+asyncpg://cpfc:cpfc@localhost:<port>/cpfc` to your local database (the port `scripts/dev/postgres-up.sh` reports). Never point tests at a shared or production database.
 
 Port already in use, a pull request from a fork, or a deploy to watch? See [CONTRIBUTING.md](CONTRIBUTING.md).

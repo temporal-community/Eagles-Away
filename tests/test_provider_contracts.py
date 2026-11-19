@@ -310,83 +310,265 @@ async def test_provider_error_never_exposes_key(settings):
         assert api.calls == 1
 
 
-async def test_no_nonstop_flights_has_specific_gap(session_input, settings):
-    from pydantic import SecretStr
-
-    from cpfc_trip.planner.providers.searchapi import search_flights
-
-    async with httpx.AsyncClient(
-        transport=httpx.MockTransport(
-            lambda request: httpx.Response(
-                200, json={"error": "Google Flights didn't return any results."}
-            )
-        )
-    ) as client:
-        api = SearchApi(
-            client,
-            settings.model_copy(update={"searchapi_api_key": SecretStr("test-secret")}),
-        )
-        result = await search_flights(api, spec(session_input))
-    assert result.calls == 2
-    assert not result.journeys
-    assert result.gaps == (
-        "No nonstop or suitable one-stop flights were found for this route and date pair.",
+def lyon_spec(session_input):
+    return spec(session_input).model_copy(
+        update={"outbound_date": date(2026, 10, 15), "return_date": date(2026, 10, 16)}
     )
 
 
-async def test_one_stop_search_only_after_nonstop_is_empty(session_input, settings):
+def lyon_booking(outbound=("08:15", "10:55"), inbound=("12:00", "12:40")) -> dict:
+    booking = data("flight-booking")
+    booking["search_parameters"].update(outbound_date="2026-10-15", return_date="2026-10-16")
+    (out,), (back,) = (direction["flights"] for direction in booking["selected_flights"])
+    for leg, day, (departs, arrives) in (
+        (out, "2026-10-15", outbound),
+        (back, "2026-10-16", inbound),
+    ):
+        leg["departure_airport"].update(date=day, time=departs)
+        leg["arrival_airport"].update(date=day, time=arrives)
+    return booking
+
+
+def listed(
+    origin: str,
+    destination: str,
+    departs: str,
+    arrives: str,
+    token: str,
+    *,
+    layover: int | None = None,
+    key: str = "departure_token",
+) -> dict:
+    (start_day, start), (end_day, end) = departs.split(), arrives.split()
+    first = {"departure_airport": {"id": origin, "date": start_day, "time": start}}
+    last = {"arrival_airport": {"id": destination, "date": end_day, "time": end}}
+    if layover is None:
+        return {"flights": [{**first, **last}], key: token}
+    via = {"id": "FRA", "date": start_day, "time": start}
+    return {
+        "flights": [{**first, "arrival_airport": via}, {"departure_airport": via, **last}],
+        "layovers": [{"id": "FRA", "duration": layover}],
+        key: token,
+    }
+
+
+def flight_server(discovery: list[dict], returns: dict, bookings: dict, calls: list):
+    def respond(request: httpx.Request) -> httpx.Response:
+        params = request.url.params
+        calls.append(params)
+        if "booking_token" in params:
+            return httpx.Response(200, json=bookings[params["booking_token"]])
+        if "departure_token" in params:
+            return httpx.Response(200, json={"best_flights": returns[params["departure_token"]]})
+        return httpx.Response(200, json={"best_flights": discovery})
+
+    return httpx.MockTransport(respond)
+
+
+async def run_flight_search(settings, transport, search_spec):
     from pydantic import SecretStr
 
     from cpfc_trip.planner.providers.searchapi import search_flights
 
+    async with httpx.AsyncClient(transport=transport) as client:
+        api = SearchApi(
+            client, settings.model_copy(update={"searchapi_api_key": SecretStr("test-secret")})
+        )
+        return await search_flights(api, search_spec)
+
+
+async def test_empty_flight_discovery_costs_one_request(session_input, settings):
     calls: list[httpx.QueryParams] = []
 
     def respond(request: httpx.Request) -> httpx.Response:
         calls.append(request.url.params)
-        if len(calls) == 1:
-            return httpx.Response(200, json={"error": "Google Flights didn't return any results."})
-        if len(calls) == 2:
-            return httpx.Response(200, json={"best_flights": [{"departure_token": "out"}]})
-        if len(calls) == 3:
-            return httpx.Response(200, json={"best_flights": [{"booking_token": "return"}]})
-        return httpx.Response(200, json=connecting_booking())
+        return httpx.Response(200, json={"error": "Google Flights didn't return any results."})
 
-    async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as client:
-        api = SearchApi(
-            client,
-            settings.model_copy(update={"searchapi_api_key": SecretStr("test-secret")}),
-        )
-        result = await search_flights(api, spec(session_input))
+    result = await run_flight_search(
+        settings, httpx.MockTransport(respond), lyon_spec(session_input)
+    )
+    assert result.calls == 1
+    assert [call["stops"] for call in calls] == ["one_stop_or_fewer"]
+    assert not result.journeys
+    assert result.failure == "provider_empty"
+    assert result.gaps == ("No flights were listed for this route and date pair.",)
+
+
+async def test_screening_follows_only_flights_that_make_the_match(session_input, settings):
+    calls: list[httpx.QueryParams] = []
+    discovery = [
+        listed("LGW", "LYS", "2026-10-15 15:00", "2026-10-15 17:40", "late"),
+        listed("LGW", "LYS", "2026-10-15 06:00", "2026-10-15 09:30", "short", layover=45),
+        listed("LGW", "LYS", "2026-10-15 06:30", "2026-10-15 11:00", "connect", layover=90),
+        listed("LGW", "LYS", "2026-10-15 08:15", "2026-10-15 10:55", "good"),
+    ]
+    returns = {
+        "good": [
+            listed(
+                "LYS", "LGW", "2026-10-16 06:55", "2026-10-16 07:35", "dawn", key="booking_token"
+            ),
+            listed("LYS", "LGW", "2026-10-16 12:00", "2026-10-16 12:40", "ok", key="booking_token"),
+        ],
+        "connect": [],
+    }
+    transport = flight_server(discovery, returns, {"ok": lyon_booking()}, calls)
+    result = await run_flight_search(settings, transport, lyon_spec(session_input))
+    assert len(result.journeys) == 1
+    followed = [call["departure_token"] for call in calls if "departure_token" in call]
+    assert sorted(followed) == ["connect", "good"]
+    assert [call["booking_token"] for call in calls if "booking_token" in call] == ["ok"]
     assert result.calls == 4
-    assert len(result.journeys) == 1
-    assert calls[0]["stops"] == "nonstop"
-    assert all(call["stops"] == "one_stop_or_fewer" for call in calls[1:])
+    assert (result.listed, result.screened, result.followed) == (4, 2, 2)
+    assert result.failure is None and not result.gaps
 
 
-async def test_complete_nonstop_trip_does_not_request_connection_search(session_input, settings):
-    from pydantic import SecretStr
+@pytest.mark.parametrize("limit", ["time", "requests"])
+async def test_truncated_flight_follow_ups_are_not_cacheable(
+    session_input, settings, monkeypatch, limit
+):
+    from cpfc_trip.persistence.search_cache import CACHEABLE_FAILURES
+    from cpfc_trip.planner.providers import searchapi
 
-    from cpfc_trip.planner.providers.searchapi import search_flights
-
+    if limit == "time":
+        monkeypatch.setattr(searchapi, "FOLLOW_UP_SECONDS", 0.05)
     calls: list[httpx.QueryParams] = []
+    discovery = [
+        listed("LGW", "LYS", f"2026-10-15 0{hour}:00", f"2026-10-15 0{hour + 2}:40", str(hour))
+        for hour in (5, 6, 7)
+    ]
+    back = listed("LYS", "LGW", "2026-10-16 12:00", "2026-10-16 12:40", "", key="booking_token")
+    ranks = 1 if limit == "time" else 2
+    returns = {
+        str(hour): [{**back, "booking_token": f"b{hour}-{rank}"} for rank in range(ranks)]
+        for hour in (5, 6, 7)
+    }
+    stale = lyon_booking()
+    stale["search_parameters"]["return_date"] = "2026-10-17"
 
-    def respond(request: httpx.Request) -> httpx.Response:
-        calls.append(request.url.params)
-        if len(calls) == 1:
-            return httpx.Response(200, json={"best_flights": [{"departure_token": "out"}]})
-        if len(calls) == 2:
-            return httpx.Response(200, json={"best_flights": [{"booking_token": "return"}]})
-        return httpx.Response(200, json=data("flight-booking"))
+    async def respond(request: httpx.Request) -> httpx.Response:
+        params = request.url.params
+        calls.append(params)
+        if "booking_token" in params:
+            if params["booking_token"] == "b7-0":
+                return httpx.Response(200, json=lyon_booking())
+            if limit == "time":
+                await asyncio.sleep(0.1)
+            return httpx.Response(200, json=stale)
+        if "departure_token" in params:
+            return httpx.Response(200, json={"best_flights": returns[params["departure_token"]]})
+        return httpx.Response(200, json={"best_flights": discovery})
 
-    async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as client:
-        api = SearchApi(
-            client,
-            settings.model_copy(update={"searchapi_api_key": SecretStr("test-secret")}),
-        )
-        result = await search_flights(api, spec(session_input))
+    result = await run_flight_search(
+        settings, httpx.MockTransport(respond), lyon_spec(session_input)
+    )
+    assert result.followed == 2
+    assert "7" not in [call.get("departure_token") for call in calls]
+    assert result.failure == "search_limits"
+    assert result.failure not in CACHEABLE_FAILURES
+    assert "Returned flight dates did not match the requested dates." in result.gaps
+
+
+async def test_next_option_is_followed_when_booking_details_do_not_verify(session_input, settings):
+    calls: list[httpx.QueryParams] = []
+    discovery = [
+        listed("LGW", "LYS", "2026-10-15 07:00", "2026-10-15 09:40", "first"),
+        listed("LGW", "LYS", "2026-10-15 08:15", "2026-10-15 10:55", "second"),
+    ]
+    back = [listed("LYS", "LGW", "2026-10-16 12:00", "2026-10-16 12:40", "", key="booking_token")]
+    mismatched = lyon_booking()
+    mismatched["search_parameters"]["return_date"] = "2026-10-17"
+    returns = {
+        "first": [{**back[0], "booking_token": "stale"}],
+        "second": [{**back[0], "booking_token": "ok"}],
+    }
+    bookings = {"stale": mismatched, "ok": lyon_booking()}
+    result = await run_flight_search(
+        settings, flight_server(discovery, returns, bookings, calls), lyon_spec(session_input)
+    )
     assert len(result.journeys) == 1
+    assert [call.get("departure_token") for call in calls if "departure_token" in call] == [
+        "first",
+        "second",
+    ]
+    assert result.calls == 5
+    assert result.followed == 2
+
+
+async def test_no_flight_fitting_the_match_spends_only_discovery(session_input, settings):
+    calls: list[httpx.QueryParams] = []
+    discovery = [
+        listed("LGW", "LYS", "2026-10-15 15:00", "2026-10-15 17:40", "late"),
+        listed("STN", "LYS", "2026-10-15 19:00", "2026-10-15 21:40", "evening"),
+    ]
+    result = await run_flight_search(
+        settings, flight_server(discovery, {}, {}, calls), lyon_spec(session_input)
+    )
+    assert result.calls == 1
+    assert result.failure == "no_timely_flight"
+    assert result.gaps == ("No listed flight arrives in time for the match and returns after it.",)
+    assert (result.listed, result.screened, result.followed) == (2, 0, 0)
+
+
+async def test_returns_before_the_match_ends_are_never_booked(session_input, settings):
+    calls: list[httpx.QueryParams] = []
+    discovery = [
+        listed("LGW", "LYS", f"2026-10-15 0{hour}:00", f"2026-10-15 0{hour + 2}:40", str(hour))
+        for hour in (6, 7)
+    ]
+    early = [listed("LYS", "LGW", "2026-10-16 06:30", "2026-10-16 07:10", "x", key="booking_token")]
+    returns = {"6": early, "7": early}
+    result = await run_flight_search(
+        settings, flight_server(discovery, returns, {}, calls), lyon_spec(session_input)
+    )
+    assert not any("booking_token" in call for call in calls)
     assert result.calls == 3
-    assert all(call["stops"] == "nonstop" for call in calls)
+    assert result.failure == "no_timely_flight"
+
+
+async def test_connections_that_change_airports_are_never_booked(session_input, settings):
+    calls: list[httpx.QueryParams] = []
+    self_transfer = listed(
+        "BHD", "LYS", "2026-10-15 06:00", "2026-10-15 11:00", "lhr-lgw", layover=90
+    )
+    self_transfer["flights"][0]["arrival_airport"] = {
+        "id": "LHR",
+        "date": "2026-10-15",
+        "time": "07:30",
+    }
+    self_transfer["flights"][1]["departure_airport"] = {
+        "id": "LGW",
+        "date": "2026-10-15",
+        "time": "09:00",
+    }
+    belfast = lyon_spec(session_input).model_copy(
+        update={"route": lyon_spec(session_input).route.model_copy(update={"origin": "BFS,BHD"})}
+    )
+    result = await run_flight_search(
+        settings, flight_server([self_transfer], {}, {}, calls), belfast
+    )
+    assert result.calls == 1
+    assert result.failure == "unsupported_connection"
+    assert "change airports" in result.gaps[0]
+
+
+async def test_returns_landing_after_the_travel_window_are_never_booked(session_input, settings):
+    calls: list[httpx.QueryParams] = []
+    discovery = [listed("LGW", "LYS", "2026-10-15 08:15", "2026-10-15 10:55", "good")]
+    returns = {
+        "good": [
+            listed(
+                "LYS", "LGW", "2026-10-16 22:50", "2026-10-17 00:10", "late", key="booking_token"
+            ),
+            listed("LYS", "LGW", "2026-10-16 12:00", "2026-10-16 12:40", "ok", key="booking_token"),
+        ]
+    }
+    deadline = datetime(2026, 10, 16, 23, 59, tzinfo=UTC) - timedelta(hours=1)
+    search_spec = lyon_spec(session_input).model_copy(update={"latest_return": deadline})
+    result = await run_flight_search(
+        settings, flight_server(discovery, returns, {"ok": lyon_booking()}, calls), search_spec
+    )
+    assert [call["booking_token"] for call in calls if "booking_token" in call] == ["ok"]
+    assert len(result.journeys) == 1
 
 
 async def test_transient_retry_repeats_only_failed_request(settings: Settings) -> None:
@@ -445,6 +627,74 @@ async def test_permanent_failure_and_exhausted_budget_do_not_retry(settings: Set
         with pytest.raises(ProviderError):
             await api.get({"engine": "google"})
         assert api.calls == 1
+
+
+async def test_throttled_provider_pauses_the_worker_without_retrying(
+    settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from pydantic import SecretStr
+
+    from cpfc_trip.planner.providers.searchapi import ProviderError, SearchApi
+
+    monkeypatch.setattr(SearchApi, "paused_until", 0.0)
+    requests: list[httpx.Request] = []
+
+    def throttle(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(429, headers={"Retry-After": "120"})
+
+    keyed = settings.model_copy(update={"searchapi_api_key": SecretStr("test-secret")})
+    async with httpx.AsyncClient(transport=httpx.MockTransport(throttle)) as client:
+        first, second = SearchApi(client, keyed), SearchApi(client, keyed)
+        with pytest.raises(ProviderError):
+            await first.get({"engine": "google"})
+        with pytest.raises(ProviderError):
+            await second.get({"engine": "google"})
+    assert len(requests) == 1
+    assert (first.calls, second.calls) == (1, 0)
+
+
+@pytest.mark.parametrize(
+    ("refused", "status", "deadline_spent"),
+    [
+        ("departure_token", 402, False),
+        ("booking_token", 503, False),
+        ("departure_token", 503, True),
+        ("booking_token", 503, True),
+    ],
+)
+async def test_incomplete_follow_up_is_not_a_cacheable_dead_end(
+    session_input, settings, monkeypatch, refused, status, deadline_spent
+):
+    from pydantic import SecretStr
+
+    from cpfc_trip.persistence.search_cache import CACHEABLE_FAILURES
+    from cpfc_trip.planner.providers.searchapi import search_flights
+
+    monkeypatch.setattr(SearchApi, "paused_until", 0.0)
+    discovery = [listed("LGW", "LYS", "2026-10-15 08:15", "2026-10-15 10:55", "good")]
+    back = [listed("LYS", "LGW", "2026-10-16 12:00", "2026-10-16 12:40", "ok", key="booking_token")]
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        params = request.url.params
+        if refused in params:
+            if deadline_spent:
+                api.deadline = asyncio.get_running_loop().time()
+            return httpx.Response(status)
+        if "booking_token" in params:
+            return httpx.Response(200, json=lyon_booking())
+        if "departure_token" in params:
+            return httpx.Response(200, json={"best_flights": back})
+        return httpx.Response(200, json={"best_flights": discovery})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as client:
+        api = SearchApi(
+            client, settings.model_copy(update={"searchapi_api_key": SecretStr("test-secret")})
+        )
+        result = await search_flights(api, lyon_spec(session_input))
+    assert not result.journeys
+    assert result.failure == ("search_limits" if deadline_spent else "provider_error")
+    assert result.failure not in CACHEABLE_FAILURES
 
 
 async def test_later_property_failure_preserves_checked_rooms(session_input, settings):
@@ -530,6 +780,120 @@ async def test_hotel_shortlist_considers_stadium_location_within_first_40(sessio
     assert all("after-first-40" not in url for url in requested_details)
 
 
+async def test_hotel_shortlist_prioritizes_named_private_bathroom_and_stops_on_success(
+    session_input, settings
+):
+    from pydantic import SecretStr
+
+    from cpfc_trip.planner.providers.searchapi import search_stays
+
+    search, details = data("hotels"), data("hotel-detail")
+    base = search["properties"][0]
+    search["properties"] = [
+        {
+            **base,
+            "title": f"Hotel {index}",
+            "link": f"https://www.booking.com/hotel/fr/candidate-{index}.html",
+            "property_id": str(index),
+            "extracted_price": 50 + index,
+        }
+        for index in range(1, 5)
+    ]
+    search["properties"][3]["room_type"] = details["rooms"][0]["name"]
+    checks = []
+
+    def respond(request):
+        params = request.url.params
+        if params["engine"] == "booking":
+            return httpx.Response(200, json=search)
+        checks.append(urlsplit(params["url"]).path)
+        return httpx.Response(200, json=details)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as client:
+        api = SearchApi(
+            client, settings.model_copy(update={"searchapi_api_key": SecretStr("test-secret")})
+        )
+        result = await search_stays(
+            api,
+            spec(session_input).model_copy(update={"private_room": True, "private_bathroom": True}),
+        )
+
+    assert checks == ["/hotel/fr/candidate-4.html", "/hotel/fr/candidate-1.html"]
+    assert [(stay.property_name, stay.bathroom, stay.room_type) for stay in result.stays] == [
+        ("Hotel 4", "private", "private")
+    ]
+    assert not result.gaps
+    assert result.calls == 3
+
+
+@pytest.mark.parametrize(
+    ("limit", "private_at", "expected_checks"),
+    [
+        pytest.param(8, 3, 6, id="verified-in-fallback"),
+        pytest.param(8, 6, 6, id="last-fallback-candidate"),
+        pytest.param(8, 7, 6, id="maximum-six-checks"),
+        pytest.param(5, 4, 3, id="one-call-left"),
+        pytest.param(4, 4, 2, id="no-calls-left"),
+    ],
+)
+async def test_private_bathroom_fallback_checks_only_remaining_ranked_candidates(
+    session_input, settings, limit, private_at, expected_checks
+):
+    from pydantic import SecretStr
+
+    from cpfc_trip.planner.providers.searchapi import PRIVATE_BATHROOM_UNVERIFIED_GAP, search_stays
+
+    search = data("hotels")
+    base = search["properties"][0]
+    search["filters"] = [{"options": [{"name": "Private bathroom", "value": "private-bath"}]}]
+    search["properties"] = [
+        {
+            **base,
+            "link": f"https://www.booking.com/hotel/fr/candidate-{index}.html",
+            "property_id": str(index),
+            "extracted_price": 50 + index,
+            "amenities": ["Private bathroom"],
+        }
+        for index in range(1, 8)
+    ]
+    property_checks = []
+    searches = []
+
+    def respond(request):
+        params = request.url.params
+        if params["engine"] == "booking":
+            searches.append(params.get("filters"))
+            return httpx.Response(200, json=search)
+        path = urlsplit(params["url"]).path
+        property_checks.append(path)
+        details = data("hotel-detail")
+        if path == f"/hotel/fr/candidate-{private_at}.html":
+            details["rooms"][1]["amenities"] = ["Private bathroom"]
+        return httpx.Response(200, json=details)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as client:
+        api = SearchApi(
+            client,
+            settings.model_copy(update={"searchapi_api_key": SecretStr("test-secret")}),
+            limit=limit,
+        )
+        result = await search_stays(
+            api, spec(session_input).model_copy(update={"private_bathroom": True})
+        )
+
+    assert searches == [None, "private-bath"]
+    assert property_checks == [
+        f"/hotel/fr/candidate-{index}.html" for index in range(1, expected_checks + 1)
+    ]
+    assert result.calls == expected_checks + len(searches)
+    if private_at <= expected_checks:
+        assert [stay.bathroom for stay in result.stays] == ["private"]
+        assert not result.gaps
+    else:
+        assert not result.stays
+        assert result.gaps == (PRIVATE_BATHROOM_UNVERIFIED_GAP,)
+
+
 def warsaw_spec(session_input):
     fixtures, routes = load_catalog()
     route = next(route for route in routes if route.id == "london-waw")
@@ -605,59 +969,178 @@ def warsaw_train(query: str) -> dict:
     }
 
 
-async def test_bialystok_trains_are_fetched_during_the_flight_token_chain(session_input, settings):
-    from pydantic import SecretStr
-
-    from cpfc_trip.planner.providers.searchapi import search_flights
-
-    train_queries: list[str] = []
+async def test_bialystok_screens_flights_against_onward_trains(session_input, settings):
+    requests: list[str] = []
     trains_requested = asyncio.Event()
+    discovery = [
+        listed("LGW", "WAW", "2026-12-09 05:00", "2026-12-09 09:30", "trap", layover=45),
+        listed("LTN", "WAW", "2026-12-09 09:00", "2026-12-09 12:30", "tight"),
+        listed("LGW", "WAW", "2026-12-09 08:15", "2026-12-09 10:55", "good"),
+    ]
+    returns = [
+        listed("WAW", "LGW", "2026-12-11 17:00", "2026-12-11 18:40", "rushed", key="booking_token"),
+        listed("WAW", "LGW", "2026-12-11 20:55", "2026-12-11 22:35", "ok", key="booking_token"),
+    ]
 
     async def respond(request: httpx.Request) -> httpx.Response:
         params = request.url.params
         if params["engine"] == "google":
-            train_queries.append(params["q"])
-            if len(train_queries) == 2:
+            requests.append("train")
+            if requests.count("train") == 2:
                 trains_requested.set()
             return httpx.Response(200, json=warsaw_train(params["q"]))
         if "booking_token" in params:
-            # Train times only need the dates; they must not wait for the slow booking step.
-            await asyncio.wait_for(trains_requested.wait(), timeout=2)
+            requests.append(f"booking:{params['booking_token']}")
             return httpx.Response(200, json=warsaw_booking())
         if "departure_token" in params:
-            return httpx.Response(200, json={"best_flights": [{"booking_token": "return"}]})
-        return httpx.Response(200, json={"best_flights": [{"departure_token": "out"}]})
+            requests.append(f"returns:{params['departure_token']}")
+            return httpx.Response(200, json={"best_flights": returns})
+        requests.append("discovery")
+        await asyncio.wait_for(trains_requested.wait(), timeout=2)
+        return httpx.Response(200, json={"best_flights": discovery})
+
+    result = await run_flight_search(
+        settings, httpx.MockTransport(respond), warsaw_spec(session_input)
+    )
+    assert sorted(requests[:3]) == ["discovery", "train", "train"]
+    assert requests[3:] == ["returns:good", "booking:ok"]
+    assert result.calls == 5
+    assert result.journeys and result.journeys[0].outbound[-1].destination == "Zielone Wzgórza"
+    assert result.journeys[0].inbound[0].origin == "Zielone Wzgórza"
+    assert (result.listed, result.screened, result.followed) == (3, 1, 1)
+
+
+async def test_failed_train_prefetch_after_empty_discovery_reports_no_flights(
+    session_input, settings
+):
+    flight_searches = []
+
+    async def respond(request: httpx.Request) -> httpx.Response:
+        if request.url.params["engine"] == "google":
+            return httpx.Response(400)
+        flight_searches.append(request.url.params["stops"])
+        return httpx.Response(200, json={"error": "Google Flights didn't return any results."})
+
+    result = await run_flight_search(
+        settings, httpx.MockTransport(respond), warsaw_spec(session_input)
+    )
+    assert flight_searches == ["one_stop_or_fewer"]
+    assert not result.journeys
+    assert result.failure == "provider_empty"
+
+
+@pytest.mark.parametrize("rail_timeout", [True, False])
+async def test_unavailable_bialystok_rail_skips_flight_follow_ups_and_cancels_sibling(
+    session_input, settings, rail_timeout
+):
+    from cpfc_trip.planner.providers import searchapi
+
+    sibling_started = asyncio.Event()
+    sibling_stopped = asyncio.Event()
+    flight_requests = 0
+    rail_requests = 0
+
+    async def respond(request: httpx.Request) -> httpx.Response:
+        nonlocal flight_requests, rail_requests
+        params = request.url.params
+        if params["engine"] == "google":
+            rail_requests += 1
+            if "from Warsaw" in params["q"]:
+                await sibling_started.wait()
+                if rail_timeout:
+                    raise httpx.ReadTimeout("train search timed out")
+                return httpx.Response(200, json={})
+            sibling_started.set()
+            try:
+                await asyncio.Future()
+            finally:
+                sibling_stopped.set()
+        if "departure_token" in params or "booking_token" in params:
+            pytest.fail("Flight details are unusable after the mandatory train search fails")
+        flight_requests += 1
+        good = listed("LGW", "WAW", "2026-12-09 08:15", "2026-12-09 10:55", "good")
+        return httpx.Response(200, json={"best_flights": [good]})
+
+    result = await run_flight_search(
+        settings, httpx.MockTransport(respond), warsaw_spec(session_input)
+    )
+    assert not result.journeys
+    assert result.failure == "onward_rail"
+    assert result.gaps == (searchapi.BIALYSTOK_ONWARD_RAIL_GAP,)
+    assert sibling_stopped.is_set()
+    assert flight_requests == 1
+    assert rail_requests == (3 if rail_timeout else 2)
+    assert result.calls == flight_requests + rail_requests
+
+
+async def test_cancelled_bialystok_search_drains_train_requests(session_input, settings):
+    from pydantic import SecretStr
+
+    from cpfc_trip.planner.providers import searchapi
+
+    started = 0
+    all_started = asyncio.Event()
+    cancelled = 0
+
+    async def respond(request: httpx.Request) -> httpx.Response:
+        nonlocal started, cancelled
+        started += 1
+        if started == 3:
+            all_started.set()
+        try:
+            await asyncio.Future()
+        except asyncio.CancelledError:
+            cancelled += 1
+            raise
+        raise AssertionError("unreachable")
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as client:
         api = SearchApi(
             client, settings.model_copy(update={"searchapi_api_key": SecretStr("test-secret")})
         )
-        result = await search_flights(api, warsaw_spec(session_input))
-    assert result.calls == 5
-    assert len(train_queries) == 2
-    assert result.journeys and result.journeys[0].outbound[-1].destination == "Zielone Wzgórza"
-    assert result.journeys[0].inbound[0].origin == "Zielone Wzgórza"
+        task = asyncio.create_task(searchapi.search_flights(api, warsaw_spec(session_input)))
+        await asyncio.wait_for(all_started.wait(), timeout=2)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    assert cancelled == 3
 
 
-async def test_failed_train_prefetch_does_not_hide_the_flight_gap(session_input, settings):
+async def test_bialystok_call_count_includes_rail_retry_started_during_cleanup(
+    session_input, settings, monkeypatch
+):
     from pydantic import SecretStr
 
-    from cpfc_trip.planner.providers.searchapi import search_flights
+    from cpfc_trip.planner.providers import searchapi
 
-    def respond(request: httpx.Request) -> httpx.Response:
-        if request.url.params["engine"] == "google":
-            return httpx.Response(400)
+    retry_pending = asyncio.Event()
+    release_retry = asyncio.Event()
+    requests = 0
+
+    async def pause_retry(_delay):
+        retry_pending.set()
+        await release_retry.wait()
+
+    monkeypatch.setattr(searchapi.asyncio, "sleep", pause_retry)
+
+    async def respond(request: httpx.Request) -> httpx.Response:
+        nonlocal requests
+        requests += 1
+        params = request.url.params
+        if params["engine"] == "google":
+            if "from Warsaw" in params["q"]:
+                return httpx.Response(503)
+            await asyncio.Future()
+        await asyncio.wait_for(retry_pending.wait(), timeout=2)
+        release_retry.set()
         return httpx.Response(200, json={"error": "Google Flights didn't return any results."})
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as client:
         api = SearchApi(
             client, settings.model_copy(update={"searchapi_api_key": SecretStr("test-secret")})
         )
-        result = await search_flights(api, warsaw_spec(session_input))
-    assert not result.journeys
-    assert result.gaps == (
-        "No nonstop or suitable one-stop flights were found for this route and date pair.",
-    )
+        result = await searchapi.search_flights(api, warsaw_spec(session_input))
+    assert result.calls == requests
 
 
 async def test_shortlisted_property_details_are_checked_together(session_input, settings):

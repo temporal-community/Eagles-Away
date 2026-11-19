@@ -12,11 +12,18 @@ export default function Privacy() {
         We store your trip preferences, planning session and saved itinerary so the request can
         recover from interruptions. Our travel search provider receives the details needed to
         search. DigitalOcean hosts the app and database; Temporal runs its
-        workflows. A necessary session cookie lets this browser access your saved plan.
+        workflows. A necessary session cookie lets this browser access your saved plan. Your
+        tab also keeps a copy of the brief so you can edit it after a search.
       </p>
       <p>
         We delete trip sessions and saved itineraries from our application database after 30 days.
         Travel prices and availability can change; check the provider before booking.
+      </p>
+      <h2>Request limits</h2>
+      <p>
+        To limit repeated requests, we store your IPv4 address or IPv6 network prefix with a
+        count of attempts to start a plan. An hourly job deletes these records once the
+        rate-limit window is at least an hour old.
       </p>
       <h2>Optional analytics</h2>
       <p>

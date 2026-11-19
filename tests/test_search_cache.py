@@ -1,5 +1,7 @@
 """Short shared search cache contracts, independent of provider traffic."""
 
+import asyncio
+import math
 from collections.abc import AsyncIterator
 from dataclasses import replace
 from datetime import UTC, date, datetime, timedelta
@@ -11,10 +13,10 @@ from sqlalchemy.ext.asyncio import AsyncEngine
 from temporalio.testing import ActivityEnvironment
 
 from cpfc_trip.config import Settings
-from cpfc_trip.domain import Party, SearchBatch, SearchSpec, SessionInput
+from cpfc_trip.domain import FlightFailure, Party, SearchBatch, SearchSpec, SessionInput
 from cpfc_trip.persistence.database import engine
 from cpfc_trip.persistence.models import Base
-from cpfc_trip.persistence.search_cache import SearchCache
+from cpfc_trip.persistence.search_cache import STALE_GAP, SearchCache
 from cpfc_trip.planner.recorded import sample
 from cpfc_trip.temporal.activities import SearchActivities
 
@@ -73,6 +75,107 @@ async def test_transport_cache_is_shared_for_24_hours_and_party_safe(
     assert await reader.get(request, "flight", now=CHECKED + timedelta(hours=24)) is None
 
 
+async def test_configured_ttl_applies_to_rows_already_stored(
+    cache_engine: AsyncEngine, session_input: SessionInput
+) -> None:
+    """Changing the TTL changes reuse of existing rows; zero always searches live."""
+    request = search_spec(session_input)
+    batch = sample(request, "flight")
+    await SearchCache(cache_engine).put(request, "flight", batch, now=CHECKED)
+    later = CHECKED + timedelta(hours=30)
+
+    assert await SearchCache(cache_engine).get(request, "flight", now=later) is None
+    week = SearchCache(cache_engine, timedelta(days=7))
+    assert await week.get(request, "flight", now=later) is not None
+    short = SearchCache(cache_engine, timedelta(minutes=10))
+    assert await short.get(request, "flight", now=CHECKED + timedelta(minutes=11)) is None
+
+    disabled = SearchCache(cache_engine, timedelta(0))
+    assert await disabled.get(request, "flight", now=CHECKED) is None
+    other = request.model_copy(update={"party": Party(adults=1)})
+    await disabled.put(other, "flight", sample(other, "flight"), now=CHECKED)
+    assert await week.get(other, "flight", now=CHECKED) is None
+
+
+async def test_early_expiration_scales_with_search_cost_and_draw(
+    cache_engine: AsyncEngine, session_input: SessionInput
+) -> None:
+    """XFetch: a read may refresh before the TTL by fetch_seconds * beta * -ln(1 - U)."""
+    request = search_spec(session_input)
+    await SearchCache(cache_engine).put(
+        request, "flight", sample(request, "flight"), fetch_seconds=10, now=CHECKED
+    )
+    nearly_expired = CHECKED + timedelta(hours=23, minutes=30)
+
+    def cache(draw: float) -> SearchCache:
+        return SearchCache(cache_engine, early_beta=360, uniform=lambda: draw)
+
+    # A draw of 0 never refreshes early; 1 - 1/e refreshes one mean lead (10 s x 360 = 1 h) early.
+    assert await cache(0.0).get(request, "flight", now=nearly_expired) is not None
+    lead = 1 - math.exp(-1)
+    assert await cache(lead).get(request, "flight", now=nearly_expired) is None
+    assert await cache(lead).get(request, "flight", now=CHECKED + timedelta(hours=22)) is not None
+    cheap = request.model_copy(update={"party": Party(adults=1)})
+    await SearchCache(cache_engine).put(
+        cheap, "flight", sample(cheap, "flight"), fetch_seconds=1, now=CHECKED
+    )
+    assert await cache(lead).get(cheap, "flight", now=nearly_expired) is not None
+
+
+@pytest.mark.parametrize(("age_hours", "served"), [(30, True), (49, False)])
+async def test_failed_live_search_falls_back_to_recent_cached_result(
+    cache_engine: AsyncEngine,
+    session_input: SessionInput,
+    monkeypatch: pytest.MonkeyPatch,
+    age_hours: int,
+    served: bool,
+) -> None:
+    """Stale-if-error: within TTL + window a cached copy stands in, labelled as older."""
+    request = search_spec(session_input)
+    batch = sample(request, "flight")
+    await SearchCache(cache_engine).put(
+        request, "flight", batch, now=datetime.now(UTC) - timedelta(hours=age_hours)
+    )
+    failure = SearchBatch(gaps=("Provider failed",), calls=3, failure="provider_error")
+
+    async def failing_acquire(spec: SearchSpec, mode: str) -> SearchBatch:
+        return failure
+
+    monkeypatch.setattr("cpfc_trip.temporal.activities.acquire", failing_acquire)
+    cache = SearchCache(cache_engine, stale_if_error=timedelta(hours=24))
+    result = await SearchActivities(cache).search_flights(request)
+    if served:
+        assert result.stale
+        outbound = result.journeys[0].outbound[0]
+        assert outbound.offer == batch.journeys[0].outbound[0].offer
+        assert STALE_GAP in outbound.caveats
+        assert STALE_GAP in result.gaps
+        assert result.calls == 3
+    else:
+        assert result == failure
+
+
+@pytest.mark.parametrize("failure_reason", ["provider_empty", "search_limits"])
+async def test_non_error_live_result_does_not_use_stale_copy(
+    cache_engine: AsyncEngine,
+    session_input: SessionInput,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_reason: FlightFailure,
+) -> None:
+    request = search_spec(session_input)
+    await SearchCache(cache_engine).put(
+        request, "flight", sample(request, "flight"), now=datetime.now(UTC) - timedelta(hours=30)
+    )
+    empty = SearchBatch(gaps=("No flights",), calls=2, failure=failure_reason)
+
+    async def empty_acquire(spec: SearchSpec, mode: str) -> SearchBatch:
+        return empty
+
+    monkeypatch.setattr("cpfc_trip.temporal.activities.acquire", empty_acquire)
+    cache = SearchCache(cache_engine, stale_if_error=timedelta(hours=24))
+    assert await SearchActivities(cache).search_flights(request) == empty
+
+
 async def test_hotel_cache_ignores_route_but_keys_preferences(
     cache_engine: AsyncEngine, session_input: SessionInput
 ) -> None:
@@ -112,14 +215,68 @@ async def test_hotel_cache_ignores_route_but_keys_preferences(
     assert await cache.get(request, "stay", now=CHECKED + timedelta(hours=24)) is None
 
 
-async def test_incomplete_results_are_not_shared(
+async def test_provider_failures_are_not_shared(
     cache_engine: AsyncEngine, session_input: SessionInput
 ) -> None:
-    """Provider failures and no-result searches must be retried on the next request."""
     cache = SearchCache(cache_engine)
     request = search_spec(session_input)
     await cache.put(request, "flight", SearchBatch(gaps=("Provider failed",), calls=1), now=CHECKED)
+    for failure in ("provider_error", "search_limits", "onward_rail"):
+        batch = SearchBatch(gaps=("No result",), calls=1, failure=failure)
+        await cache.put(request, "flight", batch, now=CHECKED)
     assert await cache.get(request, "flight", now=CHECKED) is None
+    await cache.put(request, "stay", SearchBatch(gaps=("No room",), calls=1), now=CHECKED)
+    assert await cache.get(request, "stay", now=CHECKED) is None
+
+
+async def test_flight_dead_end_is_reused_for_an_hour_and_never_replaces_a_result(
+    cache_engine: AsyncEngine, session_input: SessionInput
+) -> None:
+    cache = SearchCache(
+        cache_engine, stale_if_error=timedelta(days=1), early_beta=1000, uniform=lambda: 0.5
+    )
+    request = search_spec(session_input)
+    empty = SearchBatch(gaps=("No flights",), calls=1, failure="provider_empty")
+    await cache.put(request, "flight", empty, fetch_seconds=25, now=CHECKED)
+    hit = await cache.get(request, "flight", now=CHECKED + timedelta(minutes=59))
+    assert hit is not None and hit.calls == 0 and hit.failure == "provider_empty"
+    assert await cache.stale(request, "flight", now=CHECKED + timedelta(minutes=59)) is None
+    assert await cache.get(request, "flight", now=CHECKED + timedelta(hours=1)) is None
+    now = CHECKED + timedelta(hours=1, seconds=1)
+    await cache.put(request, "flight", empty, now=now)
+    refreshed = await cache.get(request, "flight", now=now)
+    assert refreshed is not None and refreshed.failure == "provider_empty"
+
+    other = request.model_copy(update={"return_date": date(2026, 10, 17)})
+    found = sample(other, "flight")
+    await cache.put(other, "flight", found, now=CHECKED)
+    await cache.put(other, "flight", empty, now=CHECKED)
+    kept = await cache.get(other, "flight", now=CHECKED)
+    assert kept is not None and kept.journeys == found.journeys
+
+
+async def test_nearby_departure_route_reuses_the_same_airport_search(
+    cache_engine: AsyncEngine, session_input: SessionInput
+) -> None:
+    from cpfc_trip.origins import alternate_departure_route, routes_for_origin
+
+    cache = SearchCache(cache_engine)
+    manchester = routes_for_origin(session_input.routes, "Manchester")[0]
+    liverpool = routes_for_origin(session_input.routes, "Liverpool")[0]
+    via_manchester = alternate_departure_route(liverpool, "Liverpool", "Manchester")
+    assert via_manchester is not None and via_manchester.id != manchester.id
+    request = search_spec(session_input).model_copy(update={"route": manchester})
+    await cache.put(request, "flight", sample(request, "flight"), now=CHECKED)
+
+    hit = await cache.get(
+        request.model_copy(update={"route": via_manchester}), "flight", now=CHECKED
+    )
+    assert hit is not None and hit.journeys
+    assert {journey.route_id for journey in hit.journeys} == {via_manchester.id}
+    assert (
+        await cache.get(request.model_copy(update={"route": liverpool}), "flight", now=CHECKED)
+        is None
+    )
 
 
 async def test_activity_uses_shared_cache_without_charging_calls(
@@ -144,6 +301,33 @@ async def test_activity_uses_shared_cache_without_charging_calls(
     assert reused.calls == 0
     assert reused.journeys == batch.journeys
     assert calls == 1
+
+
+async def test_concurrent_identical_searches_share_one_provider_search(
+    cache_engine: AsyncEngine, session_input: SessionInput, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    request = search_spec(session_input)
+    batch = sample(request, "flight").model_copy(update={"calls": 3})
+    release = asyncio.Event()
+    calls = 0
+
+    async def slow_acquire(spec: SearchSpec, mode: str) -> SearchBatch:
+        nonlocal calls
+        calls += 1
+        await release.wait()
+        return batch
+
+    monkeypatch.setattr("cpfc_trip.temporal.activities.acquire", slow_acquire)
+    search = SearchActivities(SearchCache(cache_engine))
+    first = asyncio.create_task(search.search_flights(request))
+    others = [asyncio.create_task(search.search_flights(request)) for _ in range(3)]
+    await asyncio.sleep(0.05)
+    release.set()
+    leader, *followers = await asyncio.gather(first, *others)
+    assert calls == 1
+    assert leader.calls == 3
+    assert all(f.calls == 0 and f.journeys == batch.journeys for f in followers)
+    assert not search.inflight
 
 
 async def test_cache_failure_falls_through_to_provider(

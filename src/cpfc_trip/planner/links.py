@@ -2,7 +2,7 @@
 
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
-from cpfc_trip.domain import Party
+from cpfc_trip.domain import Party, RecoveryLink, SearchSpec
 
 ALLOWED = {
     "www.eticketing.co.uk",
@@ -64,20 +64,45 @@ def hotel_url(value: str, start: str, end: str, party: Party) -> str | None:
         for k, v in parse_qsl(u.query)
         if k not in {"checkin", "checkout", "group_adults", "group_children", "no_rooms", "age"}
     }
-    params.update(
-        checkin=start,
-        checkout=end,
-        group_adults=str(party.adults),
-        group_children=str(len(party.child_ages)),
-        no_rooms=str(party.rooms),
-        selected_currency="GBP",
-    )
-    return urlunsplit(
-        (
-            u.scheme,
-            u.netloc,
-            u.path,
-            urlencode(list(params.items()) + [("age", str(a)) for a in party.child_ages]),
-            "",
-        )
-    )
+    return urlunsplit((u.scheme, u.netloc, u.path, _booking_query(start, end, party, params), ""))
+
+
+def _booking_query(start: str, end: str, party: Party, params: dict[str, str]) -> str:
+    params = {
+        **params,
+        "checkin": start,
+        "checkout": end,
+        "group_adults": str(party.adults),
+        "group_children": str(len(party.child_ages)),
+        "no_rooms": str(party.rooms),
+        "selected_currency": "GBP",
+    }
+    return urlencode([*params.items(), *(("age", str(age)) for age in party.child_ages)])
+
+
+def dated_recovery_links(
+    spec: SearchSpec, *, include_flights: bool = True, include_stays: bool = True
+) -> tuple[RecoveryLink, ...]:
+    start, end = spec.outbound_date.isoformat(), spec.return_date.isoformat()
+    party = spec.party
+    links = []
+    if include_flights and spec.route.mode == "flight":
+        airports = spec.route.origin.split(",")
+        origin = ", ".join(airports)
+        travellers = f"{party.adults} {'adult' if party.adults == 1 else 'adults'}"
+        children = len(party.child_ages)
+        if children:
+            travellers += f" and {children} {'child' if children == 1 else 'children'}"
+        search = f"Flights from {origin} to {spec.route.destination} on {start} through {end} for {travellers}"
+        query = urlencode({"q": search})
+        flight = flight_url(f"https://www.google.com/travel/flights?{query}")
+        if flight:
+            label = f"Search flights from {'/'.join(airports)} on Google Flights"
+            links.append(RecoveryLink(label=label, url=flight))
+    if include_stays:
+        query = _booking_query(start, end, party, {"ss": spec.fixture.city})
+        stay = safe_url(f"https://www.booking.com/searchresults.en-gb.html?{query}")
+        if stay:
+            label = f"Search stays in {spec.fixture.city} on Booking.com ({start} to {end})"
+            links.append(RecoveryLink(label=label, url=stay))
+    return tuple(links)

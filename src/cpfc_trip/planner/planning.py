@@ -1,12 +1,13 @@
 """Pure enumeration, feasibility and ranking. No I/O and no invented commercial facts."""
 
-from datetime import timedelta
+from datetime import UTC, date, datetime, time, timedelta
 from itertools import pairwise
 from zoneinfo import ZoneInfo
 
 from cpfc_trip.domain import (
     Alternative,
     Brief,
+    Check,
     Fixture,
     Journey,
     Party,
@@ -19,9 +20,41 @@ from cpfc_trip.domain import (
 from cpfc_trip.planner.maps_links import transfer_links
 from cpfc_trip.planner.prices import total
 
+MATCH_TIME_BUFFER = timedelta(hours=5)
+
+
+def _return_possible(
+    fixture: Fixture, route: Route, return_date: date, latest_return: datetime
+) -> bool:
+    earliest_departure = (fixture.kickoff_at + MATCH_TIME_BUFFER).astimezone(UTC)
+    latest_arrival = latest_return.astimezone(UTC)
+    if earliest_departure >= latest_arrival:
+        return False
+    if (
+        route.destination_timezone != fixture.timezone
+        or (route.mode == "flight" and route.onward_stations not in ((), ("Warsaw", "Białystok")))
+        or (route.mode == "rail" and route.destination != "Lyon")
+    ):
+        return True
+    start_hour, end_hour = route.gateway_departure_hours
+    if not 0 <= start_hour < end_hour <= 24:
+        return True
+    local = ZoneInfo(fixture.timezone)
+    midnight = datetime.combine(return_date, time.min)
+    opens = midnight + timedelta(hours=start_hour)
+    closes = midnight + timedelta(hours=end_hour)
+    opens_at = min(opens.replace(tzinfo=local, fold=fold).astimezone(UTC) for fold in (0, 1))
+    closes_at = max(closes.replace(tzinfo=local, fold=fold).astimezone(UTC) for fold in (0, 1))
+    return max(earliest_departure, opens_at) < min(latest_arrival, closes_at)
+
 
 def enumerate_specs(
-    brief: Brief, fixtures: tuple[Fixture, ...], routes: tuple[Route, ...], recorded: bool = False
+    brief: Brief,
+    fixtures: tuple[Fixture, ...],
+    routes: tuple[Route, ...],
+    recorded: bool = False,
+    *,
+    screen_impossible_dates: bool = False,
 ) -> list[SearchSpec]:
     grouped: list[list[SearchSpec]] = []
     for f in fixtures:
@@ -44,7 +77,6 @@ def enumerate_specs(
                 pair,
             )
         )
-        pairs = pairs[:3]
         allowed = [
             r
             for r in routes
@@ -52,6 +84,17 @@ def enumerate_specs(
             and (r.enabled or recorded)
             and (not brief.transport_mode or r.mode == brief.transport_mode)
         ]
+        eligible_pairs = []
+        for start, end in pairs:
+            eligible_routes = [
+                r
+                for r in allowed
+                if not screen_impossible_dates or _return_possible(f, r, end, window.latest_return)
+            ]
+            if eligible_routes:
+                eligible_pairs.append((start, end, eligible_routes))
+            if len(eligible_pairs) == 3:
+                break
         options = [
             SearchSpec(
                 fixture=f,
@@ -62,9 +105,10 @@ def enumerate_specs(
                 budget_tier=brief.budget_tier,
                 private_room=brief.private_room,
                 private_bathroom=brief.private_bathroom,
+                latest_return=window.latest_return,
             )
-            for start, end in pairs
-            for r in allowed
+            for start, end, eligible_routes in eligible_pairs
+            for r in eligible_routes
         ]
         grouped.append(options[: len(allowed)] if recorded else options)
     # Give every selected fixture an initial route/date candidate before spending on alternatives.
@@ -95,6 +139,14 @@ def feasible_stay(stay: Stay, fixture: Fixture, brief: Brief) -> bool:
     )
 
 
+def journey_stay_dates(journey: Journey, fixture: Fixture) -> tuple[date, date]:
+    local = ZoneInfo(fixture.timezone)
+    return (
+        journey.outbound[-1].arrives_at.astimezone(local).date(),
+        journey.inbound[0].departs_at.astimezone(local).date(),
+    )
+
+
 def feasible(
     journey: Journey,
     stay: Stay,
@@ -104,11 +156,7 @@ def feasible(
 ) -> bool:
     if not feasible_journey(journey, fixture, brief, route):
         return False
-    outbound, inbound = journey.outbound, journey.inbound
-    if (
-        stay.check_in != outbound[-1].arrives_at.astimezone(ZoneInfo(fixture.timezone)).date()
-        or stay.check_out != inbound[0].departs_at.astimezone(ZoneInfo(fixture.timezone)).date()
-    ):
+    if (stay.check_in, stay.check_out) != journey_stay_dates(journey, fixture):
         return False
     if brief.private_room and stay.room_type != "private":
         return False
@@ -133,36 +181,51 @@ def feasible_journey(
     outbound, inbound = journey.outbound, journey.inbound
     if brief.transport_mode and outbound[0].mode != brief.transport_mode:
         return False
-    if route:
-        local = ZoneInfo(fixture.timezone)
-        arrival = outbound[-1].arrives_at.astimezone(local)
-        departure = inbound[0].departs_at.astimezone(local)
-        if not (
-            route.gateway_arrival_hours[0] <= arrival.hour < route.gateway_arrival_hours[1]
-            and route.gateway_departure_hours[0]
-            <= departure.hour
-            < route.gateway_departure_hours[1]
-        ):
-            return False
-        if (route.mode == "rail" or route.onward_stations) and any(
-            b.departs_at - a.arrives_at < timedelta(minutes=route.minimum_transfer_minutes)
-            for direction in (outbound, inbound)
-            for a, b in pairwise(direction)
-        ):
-            return False
     if (
         outbound[0].departs_at < window.earliest_departure
         or inbound[-1].arrives_at > window.latest_return
     ):
         return False
-    if outbound[-1].arrives_at > fixture.kickoff_at - timedelta(hours=5):
-        return False
-    if inbound[0].departs_at < fixture.kickoff_at + timedelta(hours=5):
-        return False
-    for direction in (outbound, inbound):
-        if any(b.departs_at < a.arrives_at for a, b in pairwise(direction)):
+    return fits_match(journey, fixture, route)
+
+
+def arrives_in_time(arrival: datetime, fixture: Fixture, route: Route | None = None) -> bool:
+    if route:
+        hour = arrival.astimezone(ZoneInfo(fixture.timezone)).hour
+        if not route.gateway_arrival_hours[0] <= hour < route.gateway_arrival_hours[1]:
             return False
-    return True
+    return arrival <= fixture.kickoff_at - MATCH_TIME_BUFFER
+
+
+def leaves_after_match(departure: datetime, fixture: Fixture, route: Route | None = None) -> bool:
+    if route:
+        hour = departure.astimezone(ZoneInfo(fixture.timezone)).hour
+        if not route.gateway_departure_hours[0] <= hour < route.gateway_departure_hours[1]:
+            return False
+    return departure >= fixture.kickoff_at + MATCH_TIME_BUFFER
+
+
+def fits_match(journey: Journey, fixture: Fixture, route: Route | None = None) -> bool:
+    outbound, inbound = journey.outbound, journey.inbound
+    if not arrives_in_time(outbound[-1].arrives_at, fixture, route):
+        return False
+    if not leaves_after_match(inbound[0].departs_at, fixture, route):
+        return False
+    if (
+        route
+        and (route.mode == "rail" or route.onward_stations)
+        and any(
+            b.departs_at - a.arrives_at < timedelta(minutes=route.minimum_transfer_minutes)
+            for direction in (outbound, inbound)
+            for a, b in pairwise(direction)
+        )
+    ):
+        return False
+    return not any(
+        b.departs_at < a.arrives_at
+        for direction in (outbound, inbound)
+        for a, b in pairwise(direction)
+    )
 
 
 def grow_preview(
@@ -172,11 +235,6 @@ def grow_preview(
     routes: tuple[Route, ...],
     brief: Brief,
 ) -> tuple[Trip | None, bool]:
-    """Add a found journey or stay to the in-progress preview, never dropping one already shown.
-
-    A stay joins a journey only when their dates pair up as `feasible` requires. Also returns
-    whether any feasible journey exists yet, which starts the workflow's search cutoff.
-    """
     journeys = {
         f.id: [
             j
@@ -188,45 +246,23 @@ def grow_preview(
         for f in fixtures
     }
     journey_found = any(journeys.values())
-    candidates = (
-        [current.fixture] if current else sorted(fixtures, key=lambda f: not journeys[f.id])
+    if current and current.journey and current.stay:
+        return current, journey_found
+
+    candidates = sorted(
+        fixtures,
+        key=lambda f: (current is not None and f.id != current.fixture.id, not journeys[f.id]),
     )
     for fixture in candidates:
-        journey = current.journey if current else None
-        stay = current.stay if current else None
-        if journey is None:
-            journey = next(
-                (
-                    j
-                    for j in journeys[fixture.id]
-                    if stay is None or feasible(j, stay, fixture, brief)
-                ),
-                None,
-            )
-        if stay is None:
-            stay = next(
-                (
-                    s
-                    for b in batches[fixture.id]
-                    for s in b.stays
-                    if (
-                        feasible(journey, s, fixture, brief)
-                        if journey
-                        else feasible_stay(s, fixture, brief)
-                    )
-                ),
-                None,
-            )
-        if current and journey == current.journey and stay == current.stay:
-            return current, journey_found
-        if journey and stay:
-            return Trip(
-                fixture=fixture,
-                journey=journey,
-                stay=stay,
-                summary="A dated journey and stay were found. We’re still comparing options.",
-                gaps=("Local transfers and alternatives are still being checked.",),
-            ), journey_found
+        if journeys[fixture.id] and any(batch.stays for batch in batches[fixture.id]):
+            trip = choose(fixture, batches[fixture.id], brief, routes)
+            if trip.journey and trip.stay:
+                return trip, journey_found
+
+    if current and (current.journey or not journey_found):
+        return current, journey_found
+    for fixture in candidates:
+        journey = next(iter(journeys[fixture.id]), None)
         if journey:
             return Trip(
                 fixture=fixture,
@@ -234,6 +270,17 @@ def grow_preview(
                 summary="A dated return journey was found. We’re still checking accommodation and other options.",
                 gaps=("Accommodation and local transfers are still being checked.",),
             ), journey_found
+        if current:
+            continue
+        stay = next(
+            (
+                stay
+                for batch in batches[fixture.id]
+                for stay in batch.stays
+                if feasible_stay(stay, fixture, brief)
+            ),
+            None,
+        )
         if stay:
             return Trip(
                 fixture=fixture,
@@ -297,9 +344,14 @@ def choose(
         [*(x.quote for x in journey.outbound + journey.inbound), stay.quote, None, None, None],
         brief.travellers,
     )
-    gaps = [
-        route.transfer_note,
-        "Confirm late check-in and post-match access to the accommodation.",
+    checks = [
+        Check(
+            headline=route.transfer_headline or "Check local transfers", detail=route.transfer_note
+        ),
+        Check(
+            headline="Late check-in & post-match access",
+            detail="Confirm late check-in and post-match access to the accommodation.",
+        ),
     ]
     if (
         route.onward_stations
@@ -307,9 +359,20 @@ def choose(
         and all(leg.mode != "rail" for leg in journey.outbound)
     ):
         # Never label an airport-only journey as a complete trip to an onward destination.
-        gaps.append("Onward rail has not been verified; this is an incomplete travel option.")
+        checks.append(
+            Check(
+                headline="Onward rail not verified",
+                detail="Onward rail has not been verified; this is an incomplete travel option.",
+            )
+        )
     if fixture.venue_status != "confirmed":
-        gaps.append("The match venue and away-supporter access instructions remain provisional.")
+        checks.append(
+            Check(
+                headline="Venue & away-end access provisional",
+                detail="The match venue and away-supporter access instructions remain provisional.",
+            )
+        )
+    gaps = [c.detail for c in checks]
     alternatives = []
     seen = {(journey.outbound[0].mode, stay.property_name)}
     for other, room in candidates[1:]:
@@ -339,6 +402,7 @@ def choose(
         known_total=amount,
         price_coverage=coverage,
         gaps=tuple(gaps),
+        checks=tuple(checks),
         feasibility="needs_checks",
         transfers=route.guidance,
         maps_transfers=transfer_links(brief.origin_city, journey, stay, fixture),

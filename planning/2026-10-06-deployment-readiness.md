@@ -2,6 +2,36 @@
 
 This is a dated discovery record for the first cloud deployment. It supplements the [approved MVP architecture](mvp-plan.md#infrastructure-and-deployment) and the [engineering handoff](2026-09-30-engineering-handoff.md). No production resources or DNS records were changed during the initial review; later updates are recorded below.
 
+## V5 cutover (not yet deployed)
+
+The live App Platform spec uses `APP_ENV=preview`. `planner-main` has a build ID; `web` does
+not. Do not rely on those V4 starts being explicitly pinned. V5 workers do not register V4.
+
+1. Gate new `POST /api/sessions` requests before changing the spec. Leave snapshot reads
+   available. Use the hosted Temporal namespace to verify zero running V4 or older planning
+   workflows. Keep the old worker build online until those runs drain.
+2. Apply migration `20261118_0006` for the cache timestamp and `20261118_0007` for rate-limit
+   counters and cache outcome types. The migration job must succeed before the new `web`
+   serves session requests. A local database that ran a pre-integration rate-limit migration
+   under the old `0006` ID needs a fresh database or separate reconciliation before upgrade.
+3. Check the connection limit and account for simultaneous old and new replicas and jobs.
+   With two `web` processes and four workers during overlap, a cap of three connections each
+   (`DATABASE_POOL_SIZE=2`, `DATABASE_MAX_OVERFLOW=1`) plus one connection each for `migrate`
+   and `retention` totals 20 of 22. Give jobs a pool of one and zero overflow. This budget
+   assumes every counted process honors its cap. If the old build cannot honor it, after it
+   drains stop the old replicas before the new fleet starts, or raise the database limit first.
+4. While submissions are gated, deploy the V5 worker from its frozen release branch. Set the
+   same full commit SHA as `WORKER_BUILD_ID` on that worker and on the new `web`. Set
+   `APP_ENV=production` on `web` and verify live planning and Temporal TLS. Scope the override
+   to `web` so migration and retention jobs do not inherit its build requirements.
+5. Verify both Workflow and Activity pollers for the new build on the hosted queue, then
+   promote the build. Check `/readyz`, allow only the operator through the submission gate
+   for one approved smoke plan, and confirm the hourly retention job is enabled before
+   reopening submissions.
+6. If the cutover fails, keep submissions gated. Do not point V5 `web` at V4 workers. Restore
+   the previous `web` and worker together only after any V5 smoke run has finished. Migration
+   0007 adds a table and cache column; leave them in place on application rollback to PR #4.
+
 ## 17 November 2026 — single-run release without Gemini
 
 Commit `b83910f12de3871779905cf341a4cdcdd12ec33d` removes the review step, follow-up conversation,
@@ -29,7 +59,7 @@ upgrade. The app already uses SQLAlchemy `pool_pre_ping=True` to replace dead id
 this does not replay an interrupted transaction. A local PostgreSQL test terminates a pooled
 backend and verifies the next query reconnects successfully.
 
-New workflows use `TravelPlanningSessionWorkflowV4`. Completed V3 snapshots remain readable:
+This release started `TravelPlanningSessionWorkflowV4`. Completed V3 snapshots remain readable:
 the API falls back to the stored Temporal result if the old pinned worker is unavailable,
 discards retired delivery metadata, and maps old delivery terminal phases to `closed`.
 Keep the hosted queue and Worker Deployment name below. Use a new immutable source SHA/build ID
@@ -77,16 +107,18 @@ temporal worker deployment set-current-version --deployment-name cpfc-trip --bui
 temporal worker deployment describe-version --deployment-name cpfc-trip --build-id <old-build-id>
 ```
 
-Keep the two-worker, eight-Activity-slots-each baseline until measured queue delay warrants a
-change. Investigate if the oldest task waits over five seconds or p95 Schedule-to-Start exceeds
-two seconds for ten minutes; check provider 429s before adding capacity. The worker's 150-second
-SDK drain needs a 180-second DigitalOcean termination grace.
+Workers run `WORKER_MAX_ACTIVITIES` (default 64) Search Activities each; a session runs about
+four at once. Eight slots per worker held 18 simultaneous simulated sessions at 27–38 s to a
+decision against 4–8 s with 64 (18 November 2026). Identical searches running together on a
+worker share one provider search. Investigate if the oldest task waits over five seconds or p95
+Schedule-to-Start exceeds two seconds for ten minutes; check provider 429s before adding
+capacity. The worker's 150-second SDK drain needs a 180-second DigitalOcean termination grace.
+SearchApi's hourly limit is 20% of the monthly plan (2,000/h on the 10,000 plan). Size the plan
+to the expected peak hour, not the month.
 
-The live app spec and `.env` are ignored because they contain secrets. Use DigitalOcean runtime
-secrets for SearchApi, Gemini, Temporal Cloud, Resend and session encryption; do not commit or
-print those values. The public deployment sends email only after a visitor requests a completed
-itinerary; an unsuccessful search sends no email. Local setup stays in the [README](../README.md);
-new clones default to recorded results and preview email.
+The live app spec and `.env` are ignored because they contain secrets. Keep SearchApi and
+Temporal Cloud credentials in DigitalOcean runtime secrets. See the [README](../README.md)
+for local setup; `.env.example` selects recorded results.
 
 ## 8 October 2026 — preview origin correction
 

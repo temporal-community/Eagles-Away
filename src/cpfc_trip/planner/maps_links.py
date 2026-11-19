@@ -31,6 +31,7 @@ def transfer_links(
                 "Change the starting point in Google Maps if needed. Time, changes and fares are not included."
             ),
             url=_directions(f"{origin_city} city centre, UK", departure_point),
+            summary=f"{origin_city} centre → {departure_point}",
         ),
         MapsTransfer(
             title=f"Arrival point to your stay in {fixture.city}",
@@ -39,5 +40,6 @@ def transfer_links(
                 "Time, changes and fares are not included."
             ),
             url=_directions(arrival_point, f"{stay.property_name}, {fixture.city}"),
+            summary=f"{arrival_point} → your stay",
         ),
     )

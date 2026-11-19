@@ -2,16 +2,25 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { createAgent } from "@ui-sdk/react/agent";
 import { PlannerForm } from "./planner-form";
-import { request } from "../lib/api";
+import { request, type Brief } from "../lib/api";
+import { readBrowserBrief, saveBrowserBrief } from "../lib/browser-brief";
 import formCatalog from "../lib/form-catalog.json";
 
-vi.mock("next/navigation", () => ({ useRouter: () => ({ push: vi.fn() }) }));
+const { router } = vi.hoisted(() => ({ router: { push: vi.fn(), prefetch: vi.fn() } }));
+vi.mock("next/navigation", () => ({ useRouter: () => router }));
 vi.mock("../lib/api", async importOriginal => ({
   ...(await importOriginal<typeof import("../lib/api")>()),
-  request: vi.fn(async () => ({ ...(await import("../lib/form-catalog.json")).default, development_mode: false })),
+  request: vi.fn(async (path: string) => path === "/api/sessions"
+    ? { public_session_id: "planned-session" }
+    : { ...(await import("../lib/form-catalog.json")).default, development_mode: false }),
 }));
 
 const agent = createAgent();
+const liverpoolBrief: Brief = {
+  fixture_ids: ["uel-2026-salzburg-away"], origin_city: "Liverpool", travellers: { adults: 2, rooms: 1, child_ages: [] },
+  budget_tier: "comfort", flexibility: "day_either_side", private_room: true, private_bathroom: true, transport_mode: "flight",
+  windows: [{ fixture_id: "uel-2026-salzburg-away", earliest_departure: "2027-01-27T00:00:00+00:00", latest_return: "2027-01-29T23:59:00+00:00" }],
+};
 
 function chooseOrigin(city: string) {
   fireEvent.click(screen.getByRole("combobox", { name: "Starting from" }));
@@ -31,7 +40,7 @@ async function submittedBody() {
 
 describe("trip brief steps", () => {
   beforeEach(() => { vi.useFakeTimers({ toFake: ["Date"] }); vi.setSystemTime(new Date("2026-10-05T12:00:00Z")); });
-  afterEach(() => { cleanup(); vi.clearAllMocks(); vi.restoreAllMocks(); vi.useRealTimers(); });
+  afterEach(() => { cleanup(); vi.clearAllMocks(); vi.restoreAllMocks(); vi.useRealTimers(); window.history.replaceState(null, "", "/"); sessionStorage.clear(); });
 
   it("shows all city and match choices before the catalog request completes", async () => {
     vi.mocked(request).mockImplementationOnce(() => new Promise<never>(() => {}));
@@ -110,6 +119,77 @@ describe("trip brief steps", () => {
     fireEvent.click(travelBy("Trains"));
     const body = await submittedBody();
     expect(body.brief).toMatchObject({ origin_city: "Manchester", transport_mode: "rail" });
+    expect(router.prefetch).toHaveBeenCalledWith("/plan/");
+    expect(router.push).toHaveBeenCalledWith("/plan/?session=planned-session");
+    expect(readBrowserBrief("planned-session")?.brief).toEqual(body.brief);
+  });
+
+  it("restores the earlier choices without submitting a new search", async () => {
+    saveBrowserBrief("original", { brief: {
+      fixture_ids: ["uel-2026-lyon-away"], origin_city: "Manchester", travellers: { adults: 2, rooms: 1, child_ages: [] },
+      budget_tier: "comfort", flexibility: "day_either_side", private_room: true, private_bathroom: true, transport_mode: "rail",
+      windows: [{ fixture_id: "uel-2026-lyon-away", earliest_departure: "2026-10-14T00:00:00+01:00", latest_return: "2026-10-16T23:59:00+01:00" }],
+    } });
+    window.history.replaceState(null, "", "/?edit=original");
+    render(<PlannerForm />);
+    await waitFor(() => expect(screen.getByRole("combobox", { name: "Starting from" })).toHaveTextContent("Manchester"));
+    expect(screen.getByRole("radio", { name: /^Custom/ })).toHaveTextContent("14–16 Oct");
+    fireEvent.click(screen.getByRole("button", { name: /Continue to travel preferences/ }));
+    expect(screen.getByLabelText("Adults")).toHaveValue("2");
+    expect(travelBy("Trains")).toBeChecked();
+    expect(screen.getByRole("radio", { name: /Comfort/ })).toBeChecked();
+    expect(screen.getByRole("switch", { name: "Private room" })).toBeChecked();
+    expect(screen.getByRole("switch", { name: "Private bathroom" })).toBeChecked();
+    expect(vi.mocked(request).mock.calls.some(([path]) => path === "/api/sessions")).toBe(false);
+  });
+
+  it("keeps the recovery airport separate from the starting city when editing", async () => {
+    const recoveredBrief = { ...liverpoolBrief, departure_city: "Manchester" };
+    saveBrowserBrief("original", { brief: recoveredBrief });
+    window.history.replaceState(null, "", "/?edit=original");
+    render(<PlannerForm />);
+    await waitFor(() => expect(screen.getByRole("combobox", { name: "Starting from" })).toHaveTextContent("Liverpool"));
+    expect(screen.getByRole("radio", { name: /FC Red Bull Salzburg/ })).toBeChecked();
+    expect(screen.getByRole("radio", { name: /^Custom/ })).toHaveTextContent("27–29 Jan");
+    fireEvent.click(screen.getByRole("button", { name: /Continue to travel preferences/ }));
+    expect(screen.getByText(/Searching Manchester airport/)).toBeVisible();
+    fireEvent.click(screen.getByRole("switch", { name: "Private bathroom" }));
+    expect(vi.mocked(request).mock.calls.some(([path]) => path === "/api/sessions")).toBe(false);
+    expect((await submittedBody()).brief).toEqual({ ...recoveredBrief, private_bathroom: false });
+  });
+
+  it.each(["starting city", "travel mode"] as const)("drops the recovery airport on a change of %s", async change => {
+    saveBrowserBrief("original", { brief: {
+      ...liverpoolBrief, fixture_ids: ["uel-2026-lyon-away"], departure_city: "Manchester", windows: [],
+    } });
+    window.history.replaceState(null, "", "/?edit=original");
+    render(<PlannerForm />);
+    await waitFor(() => expect(screen.getByRole("combobox", { name: "Starting from" })).toHaveTextContent("Liverpool"));
+    if (change === "starting city") chooseOrigin("Belfast");
+    fireEvent.click(screen.getByRole("button", { name: /Continue to travel preferences/ }));
+    if (change === "travel mode") fireEvent.click(travelBy("Trains"));
+    const { brief } = await submittedBody();
+    expect(brief).not.toHaveProperty("departure_city");
+    expect(brief).toMatchObject(change === "starting city"
+      ? { origin_city: "Belfast", transport_mode: "flight" }
+      : { origin_city: "Liverpool", transport_mode: "rail" });
+  });
+
+  it("deduplicates a pending submit and reuses its token when the same brief is retried", async () => {
+    let fail!: (error: Error) => void;
+    vi.mocked(request).mockResolvedValueOnce({ ...formCatalog, development_mode: false }).mockImplementationOnce(() => new Promise((_, reject) => { fail = reject; }));
+    render(<PlannerForm />);
+    fireEvent.click(screen.getByRole("button", { name: /Continue to travel preferences/ }));
+    const form = screen.getByRole("button", { name: /Plan my away day/ }).closest("form")!;
+    fireEvent.submit(form);
+    fireEvent.submit(form);
+    expect(vi.mocked(request).mock.calls.filter(([path]) => path === "/api/sessions")).toHaveLength(1);
+    await act(async () => fail(new Error("Connection interrupted. Please retry.")));
+    fireEvent.submit(form);
+    await waitFor(() => expect(router.push).toHaveBeenCalledWith("/plan/?session=planned-session"));
+    const submissions = vi.mocked(request).mock.calls.filter(([path]) => path === "/api/sessions");
+    expect(submissions).toHaveLength(2);
+    expect(submissions[1][1]).toEqual(submissions[0][1]);
   });
 
   it("labels each trip length with the dates searched for the chosen match", async () => {

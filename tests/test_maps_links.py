@@ -30,3 +30,5 @@ def test_transfer_links_use_city_centre_and_actual_journey_stops(session_input) 
     second = parse_qs(urlparse(links[1].url).query)
     assert second["origin"] == [journey.outbound[-1].destination + " Airport"]
     assert second["destination"] == [f"{stay.property_name}, {spec.fixture.city}"]
+    assert links[0].summary == f"Manchester centre → {journey.outbound[0].origin} Airport"
+    assert links[1].summary == f"{journey.outbound[-1].destination} Airport → your stay"

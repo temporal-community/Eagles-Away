@@ -69,17 +69,20 @@
       "onward_stations": [],
       "minimum_transfer_minutes": 180,
       "transfer_note": "Transfer guidance is based on published route information; fares, disruption and match-specific arrangements must be checked.",
+      "transfer_headline": "Check fares, disruption and match-day arrangements",
       "reviewed_at": "2026-09-07T21:30:00Z",
       "guidance": [
         {
           "title": "Lyon airport ↔ Part-Dieu",
           "description": "Rhônexpress links Lyon Saint-Exupéry airport and Part-Dieu in about 29 minutes. Published service runs daily, with 15–30 minute frequencies. This planner conservatively admits airport arrivals 06:00–21:59 and departures 08:00–22:59 local; these are planning limits, not departure times. Allow for airport formalities, the tram wait and travel to your hotel. Buy transfers separately and confirm the timetable.",
+          "summary": "Rhônexpress airport ↔ Part-Dieu",
           "source_url": "https://www.rhonexpress.fr/en_GB/discover-the-service",
           "reviewed_at": "2026-09-07T21:30:00Z"
         },
         {
           "title": "Getting to and from the match",
           "description": "OL publishes direct tram shuttles from Part-Dieu Villette Sud to Groupama Stadium (normally under 20 minutes), with return shuttles after matches. Reserve the event transport ticket and check fixture-specific operating times and away-supporter instructions before booking. T7 changes operation when event shuttles start. Exact Palace-match shuttle times and fares are not yet confirmed.",
+          "summary": "Tram shuttle to the stadium",
           "source_url": "https://www.olvallee.fr/acces/",
           "reviewed_at": "2026-09-07T21:30:00Z"
         }
@@ -108,6 +111,7 @@
       "onward_stations": [],
       "minimum_transfer_minutes": 180,
       "transfer_note": "Istanbul Airport has a metro connection into the city. The airport-to-hotel and hotel-to-stadium transfers are separate and unpriced; confirm current service and away-supporter access.",
+      "transfer_headline": "Airport metro, hotel and stadium transfers not priced",
       "reviewed_at": "2026-10-05T00:00:00Z",
       "source_urls": [
         "https://www.metro.istanbul/Content/assets/uploaded/A%C4%9F%20Haritas%C4%B1.pdf"
@@ -124,6 +128,7 @@
         {
           "title": "Istanbul airport and city transfer",
           "description": "Istanbul Airport has a metro connection into the city. The airport-to-hotel and hotel-to-stadium transfers are separate and unpriced; confirm current service and away-supporter access.",
+          "summary": "Airport metro to the city",
           "source_url": "https://www.metro.istanbul/Content/assets/uploaded/A%C4%9F%20Haritas%C4%B1.pdf",
           "reviewed_at": "2026-10-05T00:00:00Z"
         }
@@ -139,7 +144,8 @@
       "enabled": false,
       "onward_stations": [],
       "minimum_transfer_minutes": 180,
-      "transfer_note": "Candidate pattern: fixture-date and local transfer evidence must be reviewed before enabling."
+      "transfer_note": "Candidate pattern: fixture-date and local transfer evidence must be reviewed before enabling.",
+      "transfer_headline": "Local transfers not yet reviewed"
     },
     {
       "id": "london-waw",
@@ -155,6 +161,7 @@
       ],
       "minimum_transfer_minutes": 180,
       "transfer_note": "Change between Warsaw Chopin Airport and Warsaw Central separately. Direct Warsaw Central–Zielone Wzgórza train times must be verified on both travel dates, with at least three hours for each airport/station transfer. Rail fares and the Białystok station-to-stadium transfer are not included.",
+      "transfer_headline": "Airport → Warsaw Central → train to Białystok",
       "reviewed_at": "2026-10-05T00:00:00Z",
       "source_urls": [
         "https://www.skm.warszawa.pl/en/faq-2/"
@@ -171,6 +178,7 @@
         {
           "title": "Warsaw and Białystok rail connection",
           "description": "Change between Warsaw Chopin Airport and Warsaw Central separately. Direct Warsaw Central–Zielone Wzgórza train times must be verified on both travel dates, with at least three hours for each airport/station transfer. Rail fares and the Białystok station-to-stadium transfer are not included.",
+          "summary": "Warsaw → Białystok by rail",
           "source_url": "https://www.skm.warszawa.pl/en/faq-2/",
           "reviewed_at": "2026-10-05T00:00:00Z"
         }
@@ -187,6 +195,7 @@
       "onward_stations": [],
       "minimum_transfer_minutes": 180,
       "transfer_note": "Salzburg Airport publishes bus links to the city and main station. Airport, hotel and stadium transfers are separate and unpriced; confirm service times and away-supporter instructions.",
+      "transfer_headline": "Airport bus, hotel and stadium transfers not priced",
       "reviewed_at": "2026-10-05T00:00:00Z",
       "source_urls": [
         "https://www.salzburg-airport.com/en/flights-arrival/arrival-to-the-airport/public-transportation"
@@ -203,6 +212,7 @@
         {
           "title": "Salzburg airport and city transfer",
           "description": "Salzburg Airport publishes bus links to the city and main station. Airport, hotel and stadium transfers are separate and unpriced; confirm service times and away-supporter instructions.",
+          "summary": "Airport bus to the city",
           "source_url": "https://www.salzburg-airport.com/en/flights-arrival/arrival-to-the-airport/public-transportation",
           "reviewed_at": "2026-10-05T00:00:00Z"
         }
@@ -221,7 +231,8 @@
         "Salzburg"
       ],
       "minimum_transfer_minutes": 180,
-      "transfer_note": "Candidate pattern: fixture-date and local transfer evidence must be reviewed before enabling."
+      "transfer_note": "Candidate pattern: fixture-date and local transfer evidence must be reviewed before enabling.",
+      "transfer_headline": "Local transfers not yet reviewed"
     },
     {
       "id": "london-paris-lyon",
@@ -236,17 +247,20 @@
       ],
       "minimum_transfer_minutes": 180,
       "transfer_note": "Transfer guidance is based on published route information; fares, disruption and match-specific arrangements must be checked.",
+      "transfer_headline": "Check fares, disruption and match-day arrangements",
       "reviewed_at": "2026-09-07T21:30:00Z",
       "guidance": [
         {
           "title": "Changing stations in Paris",
           "description": "Eurostar uses Gare du Nord; the Lyon TGV uses Gare de Lyon. Eurostar describes the RER D connection as about 30 minutes. The planner requires at least three hours between trains in each direction, including walking and border/security time on the return. Connections are restricted to daytime and early evening. Local tickets cost extra; separately purchased train tickets do not automatically guarantee missed-connection protection. Check Eurostar arrival requirements before travel.",
+          "summary": "Gare du Nord → Gare de Lyon",
           "source_url": "https://www.eurostar.com/uk-en/train/london-to-lyon",
           "reviewed_at": "2026-09-07T21:30:00Z"
         },
         {
           "title": "Getting to and from the match",
           "description": "OL publishes direct tram shuttles from Part-Dieu Villette Sud to Groupama Stadium (normally under 20 minutes), with return shuttles after matches. Reserve the event transport ticket and check fixture-specific operating times and away-supporter instructions before booking. T7 changes operation when event shuttles start. Exact Palace-match shuttle times and fares are not yet confirmed.",
+          "summary": "Tram shuttle to the stadium",
           "source_url": "https://www.olvallee.fr/acces/",
           "reviewed_at": "2026-09-07T21:30:00Z"
         }
